@@ -36,13 +36,14 @@ import torch
 from torch import Tensor
 
 from config import Config
-from ctmc import num_ordered_pairs
+from ctmc import num_ordered_pairs, sample_exponential
 from h_model import HModel
 from table_space import (
     all_neighbors,
     col_sums,
     exact_margins_satisfied,
     row_sums,
+    sample_uniform_tables,
     squared_margin_error,
     soft_reward,
 )
@@ -116,10 +117,7 @@ def guided_step(
     if total_rate.item() <= 0:
         return x.clone(), cfg.max_time_step, False
 
-    dt = torch.distributions.Exponential(total_rate).sample(
-        generator=generator
-    ) if generator is not None else torch.distributions.Exponential(total_rate).sample()
-    dt = float(dt.item())
+    dt = sample_exponential(float(total_rate.item()), generator=generator)
 
     probs = guided_rates / total_rate
     idx = torch.multinomial(probs, num_samples=1, generator=generator).item()
@@ -171,19 +169,26 @@ def simulate_guided_trajectory(
 
 
 def simulate_guided_batch(
-    x0: Tensor,
     model: HModel,
     cfg: Config,
     num_samples: int,
     seed: Optional[int] = None,
 ) -> List[GuidedSampleResult]:
-    """Generate ``num_samples`` independent guided trajectories from x0."""
+    """Generate ``num_samples`` independent guided trajectories.
+
+    Each trajectory starts from an independent X_0 ~ Uniform(E_N), drawn via
+    exact stars-and-bars sampling, matching the agreed procedure rather than
+    a single shared deterministic starting table.
+    """
     seed = cfg.seed if seed is None else seed
     generator = torch.Generator()
     generator.manual_seed(seed)
 
     results = []
     for _ in range(num_samples):
+        x0 = sample_uniform_tables(
+            1, cfg.m, cfg.n, cfg.total_count, generator=generator
+        ).squeeze(0)
         results.append(
             simulate_guided_trajectory(x0, model, cfg, generator=generator)
         )

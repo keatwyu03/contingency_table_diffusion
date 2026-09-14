@@ -58,10 +58,13 @@ def cmd_calibrate(cfg: Config) -> None:
 
 
 def cmd_make_dataset(cfg: Config) -> None:
-    """Generate and save the offline h-training dataset."""
+    """Generate and save the offline h-training dataset.
+
+    Each trajectory starts from an independent X_0 ~ Uniform(E_N) (see
+    generate_h_dataset), not from a single fixed deterministic table.
+    """
     set_seed(cfg.seed)
-    start_table = make_start_table_first_cell(cfg.m, cfg.n, cfg.total_count)
-    dataset = generate_h_dataset(cfg, start_table)
+    dataset = generate_h_dataset(cfg)
     dataset.save(cfg.dataset_path)
     print(f"Generated {len(dataset)} samples from {cfg.num_trajectories} trajectories.")
     print(f"Saved dataset to {cfg.dataset_path}")
@@ -82,13 +85,16 @@ def cmd_train_h(cfg: Config) -> None:
 
 
 def cmd_sample_guided(cfg: Config) -> None:
-    """Run the guided CTMC sampler using the trained h checkpoint."""
+    """Run the guided CTMC sampler using the trained h checkpoint.
+
+    Each guided sample starts from an independent X_0 ~ Uniform(E_N) (see
+    simulate_guided_batch), not from a single fixed deterministic table.
+    """
     set_seed(cfg.seed)
     model = load_h_model(cfg)
     model.eval()
-    start_table = make_start_table_first_cell(cfg.m, cfg.n, cfg.total_count)
     results = simulate_guided_batch(
-        start_table, model, cfg, num_samples=cfg.num_guided_samples
+        model, cfg, num_samples=cfg.num_guided_samples
     )
     text = summarize_guided_samples(results, cfg)
     print(text)

@@ -1,16 +1,3 @@
-"""Configuration for the guided-CTMC contingency table sampler.
-
-All hyperparameters live in a single dataclass, ``Config``. Two rates are
-used in this project and must not be confused:
-
-* ``ctmc_rate`` (default 50000.0): the constant proposal rate of the
-  *unconditional* CTMC over the table space (jumps per unit time).
-* ``reward_gamma`` (default 0.02): the decay rate in the soft terminal
-  reward ``R(x) = exp(-reward_gamma * S_2(x))``. This is intentionally
-  named ``reward_gamma`` and not ``beta`` so it is never confused with
-  ``ctmc_rate``.
-"""
-
 from __future__ import annotations
 
 import os
@@ -24,7 +11,6 @@ import torch
 class Config:
     """Central configuration for the contingency-table CTMC pipeline."""
 
-    # --- Table geometry -------------------------------------------------
     m: int = 12
     n: int = 12
     total_count: int = 82

@@ -52,11 +52,64 @@ class TrajectorySnapshot:
 
 @dataclass
 class SimulationResult:
-    """Result of simulating one CTMC trajectory to terminal time T."""
+    """Result of simulating one CTMC trajectory to terminal time T.
+
+    ``path`` records the *entire* trajectory as one entry per accepted jump:
+    ``path[k] = (t_k, x_k)`` where ``x_k`` is the table that is current
+    starting at time ``t_k`` (i.e. the state immediately after the k-th
+    accepted jump; ``path[0]`` is always ``(0.0, x0)``). Rejected proposals
+    are not recorded since they do not change the table -- the state at any
+    query time ``t`` is simply the table from the last path entry with
+    ``t_k <= t`` (see ``table_at_time``). Storing the full path lets callers
+    (e.g. h_dataset.py) sample as many intermediate observations as they
+    like from a single simulation run, without re-simulating.
+    """
 
     terminal_table: Tensor
     snapshots: List[TrajectorySnapshot]
     num_jumps: int
+    path: List[TrajectorySnapshot]
+
+
+def table_at_time(path: List[TrajectorySnapshot], t: float, terminal_time: float) -> Tensor:
+    """Look up the table that is current at time ``t`` from a stored path.
+
+    ``path`` must be sorted by time ascending with ``path[0].time == 0.0``
+    (as produced by ``simulate_trajectory``). Returns the table associated
+    with the last path entry whose time is <= t (binary search over the
+    jump times), i.e. the state that held from that jump until the next one.
+    """
+    if t <= 0.0:
+        return path[0].table
+    if t >= terminal_time:
+        return path[-1].table
+
+    times = [snap.time for snap in path]
+    lo, hi = 0, len(times) - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if times[mid] <= t:
+            lo = mid
+        else:
+            hi = mid - 1
+    return path[lo].table
+
+
+def sample_exponential(
+    rate: float, generator: Optional[torch.Generator] = None, device: str = "cpu"
+) -> float:
+    """Sample one Exponential(rate) draw, honoring an optional generator.
+
+    ``torch.distributions.Exponential.sample()`` does not accept a
+    ``generator`` argument, so reproducibility must go through the inverse
+    CDF instead: if U ~ Uniform(0, 1) then -ln(1 - U) / rate ~ Exponential(rate).
+    ``torch.rand`` does accept ``generator``, so this ties the draw to the
+    caller's RNG state exactly like every other sampling call in this module.
+    """
+    u = torch.rand((), generator=generator, device=device)
+    # Clamp away from 1.0 to avoid log(0) in the (measure-zero) case u == 1.
+    u = torch.clamp(u, max=1.0 - 1e-12)
+    return float(-torch.log1p(-u) / rate)
 
 
 def num_cells(m: int, n: int) -> int:
@@ -122,15 +175,17 @@ def simulate_trajectory(
         x0: starting table, shape (m, n).
         terminal_time: T, the time horizon to simulate to.
         ctmc_rate: constant proposal rate (Exponential rate parameter).
-        snapshot_times: optional sorted sequence of times in [0, T] at which
-            to record the table state (nearest proposal-time <= requested
-            time, i.e. the state that is current at that time).
+        snapshot_times: optional sequence of times in [0, T] at which to
+            record the table state (looked up from the full stored path
+            after simulation finishes, so this costs no extra simulation
+            work -- see ``table_at_time``). If omitted, ``snapshots`` is
+            empty but ``result.path`` still holds the entire trajectory.
         generator: optional torch.Generator for reproducibility.
         device: torch device string.
 
     Returns:
         SimulationResult with terminal_table, snapshots (one per requested
-        snapshot time, in order), and the number of accepted jumps.
+        snapshot time, in order), num_jumps, and the full jump path.
     """
     m, n = x0.shape[0], x0.shape[1]
     d = num_cells(m, n)
@@ -138,26 +193,11 @@ def simulate_trajectory(
     t = 0.0
     num_jumps = 0
 
-    snapshot_times = list(snapshot_times) if snapshot_times is not None else []
-    snapshots: List[TrajectorySnapshot] = []
-    snap_idx = 0
+    path: List[TrajectorySnapshot] = [TrajectorySnapshot(time=0.0, table=x.clone())]
 
     while t < terminal_time:
-        dt = torch.distributions.Exponential(ctmc_rate).sample(
-            generator=generator
-        ).item() if generator is not None else float(
-            torch.distributions.Exponential(ctmc_rate).sample()
-        )
+        dt = sample_exponential(ctmc_rate, generator=generator, device=device)
         next_t = t + dt
-
-        # Record any snapshot times that fall within (t, next_t], i.e. whose
-        # current state (before this proposal takes effect) is `x`, using
-        # min(next_t, terminal_time) as the boundary.
-        while snap_idx < len(snapshot_times) and snapshot_times[snap_idx] < min(
-            next_t, terminal_time
-        ):
-            snapshots.append(TrajectorySnapshot(time=snapshot_times[snap_idx], table=x.clone()))
-            snap_idx += 1
 
         if next_t >= terminal_time:
             t = terminal_time
@@ -166,19 +206,23 @@ def simulate_trajectory(
         source, dest = propose_move(d, generator=generator, device=device)
         flat = x.reshape(-1)
         if flat[source] > 0:
-            new_x = apply_move(x, source, dest)
-            x = new_x
+            x = apply_move(x, source, dest)
             num_jumps += 1
-        # else: rejected proposal, x unchanged, but time still advances.
+            path.append(TrajectorySnapshot(time=next_t, table=x.clone()))
+        # else: rejected proposal, x unchanged (no new path entry needed),
+        # but time still advances.
         t = next_t
 
-    # Any remaining requested snapshot times (including exactly T) get the
-    # final state.
-    while snap_idx < len(snapshot_times):
-        snapshots.append(TrajectorySnapshot(time=snapshot_times[snap_idx], table=x.clone()))
-        snap_idx += 1
+    snapshots: List[TrajectorySnapshot] = []
+    if snapshot_times:
+        for st in snapshot_times:
+            snapshots.append(
+                TrajectorySnapshot(time=st, table=table_at_time(path, st, terminal_time))
+            )
 
-    return SimulationResult(terminal_table=x, snapshots=snapshots, num_jumps=num_jumps)
+    return SimulationResult(
+        terminal_table=x, snapshots=snapshots, num_jumps=num_jumps, path=path
+    )
 
 
 def simulate_batch(

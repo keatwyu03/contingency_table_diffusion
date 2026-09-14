@@ -25,8 +25,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from config import Config
-from ctmc import simulate_trajectory
-from table_space import squared_margin_error, soft_reward
+from ctmc import simulate_trajectory, table_at_time
+from table_space import sample_uniform_tables, squared_margin_error, soft_reward
 
 
 @dataclass
@@ -78,16 +78,21 @@ class HDataset(Dataset):
 
 def generate_h_dataset(
     cfg: Config,
-    start_table: Tensor,
     num_trajectories: Optional[int] = None,
     num_time_samples_per_trajectory: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> HDataset:
     """Generate an offline dataset of (t, X_t, R(X_T)) triples.
 
+    Each trajectory starts from an independent X_0 ~ Uniform(E_N), drawn via
+    exact stars-and-bars sampling (table_space.sample_uniform_tables) -- NOT
+    from a single fixed deterministic table. This matches the agreed
+    procedure X_0 ~ Uniform(E_N) so h_theta is trained on trajectories that
+    start spread across the whole table space rather than all funneling
+    through one corner of it.
+
     Args:
         cfg: resolved Config.
-        start_table: the fixed starting table (unnormalized, shape (m, n)).
         num_trajectories: overrides cfg.num_trajectories if given.
         num_time_samples_per_trajectory: overrides cfg if given.
         seed: overrides cfg.seed if given.
@@ -112,24 +117,17 @@ def generate_h_dataset(
     samples: List[HDatasetSample] = []
 
     for _ in range(num_trajectories):
-        # Sample intermediate times uniformly in (0, T), then sort; always
-        # include T itself is NOT required here since we compute R(X_T)
-        # separately as the terminal target, but we still want the snapshot
-        # at t=T available for the optional boundary loss, so we include it.
-        interior_times = torch.rand(
-            max(num_time_samples - 1, 0), generator=generator
-        ) * cfg.terminal_time
-        times = torch.cat(
-            [interior_times, torch.tensor([cfg.terminal_time])]
-        )
-        times, _ = torch.sort(times)
-        times_list = times.tolist()
+        start_table = sample_uniform_tables(
+            1, cfg.m, cfg.n, cfg.total_count, generator=generator
+        ).squeeze(0)
 
+        # Simulate once, storing the entire jump path (see SimulationResult
+        # in ctmc.py). Intermediate observation times are then drawn and
+        # looked up from that single stored path -- no re-simulation.
         result = simulate_trajectory(
             start_table,
             cfg.terminal_time,
             cfg.ctmc_rate,
-            snapshot_times=times_list,
             generator=generator,
         )
 
@@ -139,9 +137,21 @@ def generate_h_dataset(
         ).squeeze(0)
         r_terminal = float(soft_reward(s2_terminal, cfg.reward_gamma).item())
 
-        for snap in result.snapshots:
-            normalized_table = snap.table / cfg.total_count
-            normalized_time = snap.time / cfg.terminal_time
+        # Sample intermediate times uniformly in (0, T), then sort; always
+        # include T itself so the snapshot at t=T is available for the
+        # optional boundary loss.
+        interior_times = torch.rand(
+            max(num_time_samples - 1, 0), generator=generator
+        ) * cfg.terminal_time
+        times = torch.cat(
+            [interior_times, torch.tensor([cfg.terminal_time])]
+        )
+        times, _ = torch.sort(times)
+
+        for t in times.tolist():
+            table_t = table_at_time(result.path, t, cfg.terminal_time)
+            normalized_table = table_t / cfg.total_count
+            normalized_time = t / cfg.terminal_time
             samples.append(
                 HDatasetSample(
                     current_table=normalized_table,
