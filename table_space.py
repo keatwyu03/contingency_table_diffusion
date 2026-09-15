@@ -99,25 +99,38 @@ def make_start_table_even(m: int, n: int, total_count: int) -> Tensor:
 
 
 def all_neighbors(x: Tensor) -> Tuple[Tensor, List[Tuple[int, int]]]:
+    """Enumerate every valid (src, dst) single-unit move's resulting table.
+
+    Vectorized: builds all neighbor tables in one batched tensor op (no
+    per-neighbor Python-level .clone()), which matters because a table can
+    have thousands of valid (src, dst) pairs (up to positive_cells * (d-1)).
+    Produces the exact same set of neighbor tables and (src, dst) ordering
+    as the previous nested-Python-loop implementation.
+    """
     m, n = x.shape[0], x.shape[1]
     d = m * n
     flat = x.reshape(-1)
-    positive_idx = torch.nonzero(flat > 0, as_tuple=False).view(-1).tolist()
+    positive_idx = torch.nonzero(flat > 0, as_tuple=False).view(-1)
 
-    neighbor_list = []
-    cell_pairs: List[Tuple[int, int]] = []
-    for src in positive_idx:
-        for dst in range(d):
-            if dst == src:
-                continue
-            new_flat = flat.clone()
-            new_flat[src] -= 1
-            new_flat[dst] += 1
-            neighbor_list.append(new_flat.view(m, n))
-            cell_pairs.append((src, dst))
+    if positive_idx.numel() == 0:
+        return torch.empty((0, m, n), dtype=x.dtype), []
 
-    if len(neighbor_list) == 0:
-        neighbors = torch.empty((0, m, n), dtype=x.dtype)
-    else:
-        neighbors = torch.stack(neighbor_list, dim=0)
+    dst_idx = torch.arange(d, dtype=positive_idx.dtype, device=x.device)
+    # (num_src, d) grid of every (src, dst) pair with dst != src, in the
+    # same row-major (src outer, dst inner) order as the old nested loop.
+    src_grid = positive_idx.unsqueeze(1).expand(-1, d)
+    dst_grid = dst_idx.unsqueeze(0).expand(positive_idx.numel(), -1)
+    keep_mask = dst_grid != src_grid
+
+    src_flat = src_grid[keep_mask]
+    dst_flat = dst_grid[keep_mask]
+    num_pairs = src_flat.shape[0]
+
+    neighbors_flat = flat.unsqueeze(0).expand(num_pairs, d).clone()
+    row_idx = torch.arange(num_pairs, device=x.device)
+    neighbors_flat[row_idx, src_flat] -= 1
+    neighbors_flat[row_idx, dst_flat] += 1
+
+    neighbors = neighbors_flat.view(num_pairs, m, n)
+    cell_pairs = list(zip(src_flat.tolist(), dst_flat.tolist()))
     return neighbors, cell_pairs

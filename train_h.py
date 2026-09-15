@@ -121,7 +121,7 @@ def train_h_model(
     epoch_bar = tqdm(range(cfg.num_epochs), desc="train_h[epochs]")
     for epoch in epoch_bar:
         model.train()
-        train_loss_sum = 0.0
+        train_loss_sum = torch.zeros((), device=device)
         train_count = 0
         batch_bar = tqdm(train_loader, desc=f"epoch {epoch + 1} train", leave=False)
         for tables, times, rewards in batch_bar:
@@ -136,15 +136,16 @@ def train_h_model(
             optimizer.step()
 
             batch_size = tables.shape[0]
-            train_loss_sum += loss.item() * batch_size
+            # Accumulate as a tensor (no .item()) to avoid forcing a
+            # CUDA sync on every step; only sync once per epoch below.
+            train_loss_sum += loss.detach() * batch_size
             train_count += batch_size
-            batch_bar.set_postfix(loss=loss.item())
 
-        train_loss = train_loss_sum / max(train_count, 1)
+        train_loss = (train_loss_sum / max(train_count, 1)).item()
         history.train_losses.append(train_loss)
 
         model.eval()
-        val_loss_sum = 0.0
+        val_loss_sum = torch.zeros((), device=device)
         val_count = 0
         with torch.no_grad():
             for tables, times, rewards in val_loader:
@@ -155,10 +156,10 @@ def train_h_model(
                     model, tables, times, rewards, cfg.boundary_loss_weight
                 )
                 batch_size = tables.shape[0]
-                val_loss_sum += loss.item() * batch_size
+                val_loss_sum += loss.detach() * batch_size
                 val_count += batch_size
 
-        val_loss = val_loss_sum / max(val_count, 1)
+        val_loss = (val_loss_sum / max(val_count, 1)).item()
         history.val_losses.append(val_loss)
 
         epoch_bar.set_postfix(train_loss=train_loss, val_loss=val_loss)

@@ -19,8 +19,8 @@ class Config:
     terminal_time: float = 1.0
     ctmc_rate: float = 100.0
 
-    # --- Reward parameters --------------------------------------------------
-    reward_gamma: float = 0.02
+
+    reward_gamma: float = 0.005
 
     # --- Target margins ----------------------------------------------------
     target_rows: List[int] = field(
@@ -35,7 +35,11 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # --- Dataset generation --------------------------------------------------
-    batch_size: int = 64
+    # 512 (up from 64): h_theta is <1M params, so batch_size=64 under-uses
+    # the GPU per step and pays ~140K step launches/epoch-loop-worth of
+    # Python + CUDA sync overhead for 50 epochs over 180K train samples. A
+    # larger batch cuts step count ~8x with each step still fast.
+    batch_size: int = 512
     num_original_samples: int = 200000
 
     # --- Training ------------------------------------------------------------

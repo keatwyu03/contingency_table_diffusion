@@ -110,6 +110,12 @@ def guided_step(
     the direction time moves in the caller (simulate_guided_trajectory)
     differs.
 
+    Kept for single-trajectory use (e.g. tests); simulate_guided_batch below
+    uses a vectorized batched version of this same logic instead of calling
+    this per sample, since the model forward pass is by far the dominant
+    cost and batching it across live samples is what makes many-sample runs
+    tractable.
+
     Returns:
         (next_table, dt, jumped): the (possibly unchanged) next table, the
         waiting time sampled, and whether a jump actually occurred (False
@@ -176,6 +182,10 @@ def simulate_guided_trajectory(
     Despite the "terminal_table" field name (kept for compatibility with
     the reporting/summary code), the returned table here is the sampler's
     OUTPUT at t=0, i.e. the generated X_0 -- not a t=T terminal state.
+
+    This single-trajectory path (via guided_step) is O(1) model forward
+    passes per sample per step; simulate_guided_batch batches these across
+    samples instead and should be preferred whenever num_samples > 1.
     """
     x = x_start.clone()
     t = cfg.terminal_time
@@ -204,6 +214,580 @@ def simulate_guided_trajectory(
     return GuidedSampleResult(
         terminal_table=x, num_jumps=num_jumps, trajectory=trajectory, jump_times=jump_times
     )
+
+
+def _log_h_batch_multi_time(
+    model: HModel,
+    tables: Tensor,
+    times: Tensor,
+    total_count: int,
+    terminal_time: float,
+    eval_batch_size: int = _LOG_H_EVAL_BATCH_SIZE,
+) -> Tensor:
+    """Like _log_h_batch, but each row of ``tables`` has its own time.
+
+    Args:
+        tables: (B, m, n) unnormalized tables.
+        times: (B,) unnormalized times, one per row (not a shared scalar).
+
+    Returns:
+        (B,) tensor of log h_theta values, on CPU.
+    """
+    device = next(model.parameters()).device
+    B = tables.shape[0]
+
+    chunks: List[Tensor] = []
+    with torch.no_grad():
+        for start in range(0, B, eval_batch_size):
+            end = min(start + eval_batch_size, B)
+            chunk_tables = (tables[start:end].to(device)) / total_count
+            chunk_time = (times[start:end].to(device)) / terminal_time
+            chunks.append(model.forward_log_h(chunk_tables, chunk_time).cpu())
+    return torch.cat(chunks, dim=0)
+
+
+def _guided_batch_step(
+    active_x: Tensor,
+    active_t: Tensor,
+    model: HModel,
+    cfg: Config,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Vectorized version of guided_step over all currently-active samples.
+
+    Builds every active sample's neighbor set, concatenates them into one
+    (sum_of_neighbor_counts, m, n) tensor tagged with a per-row segment id,
+    and evaluates h_theta with a SINGLE batched (chunked) model forward pass
+    covering all active samples' current tables and all their neighbors
+    together -- replacing what used to be ``len(active)`` separate forward
+    passes per outer step.
+
+    Args:
+        active_x: (A, m, n) current tables of the A active samples.
+        active_t: (A,) current times of the A active samples.
+
+    Returns:
+        (next_x, dt, jumped): (A, m, n) next tables (unchanged where no jump
+        occurred), (A,) sampled waiting times, (A,) bool jump flags -- same
+        per-sample semantics as guided_step, just batched.
+    """
+    A = active_x.shape[0]
+    K = num_ordered_pairs(cfg.m, cfg.n)
+    log_q_base = float(torch.log(torch.tensor(cfg.ctmc_rate / K)).item())
+
+    neighbor_tables: List[Tensor] = []
+    neighbor_times: List[float] = []
+    segment_ids: List[int] = []
+    neighbor_counts = torch.zeros(A, dtype=torch.long)
+
+    for i in range(A):
+        neighbors, _ = all_neighbors(active_x[i])
+        c = neighbors.shape[0]
+        neighbor_counts[i] = c
+        if c > 0:
+            neighbor_tables.append(neighbors)
+            neighbor_times.extend([float(active_t[i].item())] * c)
+            segment_ids.extend([i] * c)
+
+    next_x = active_x.clone()
+    dt = torch.full((A,), cfg.max_time_step, dtype=torch.float32)
+    jumped = torch.zeros(A, dtype=torch.bool)
+
+    has_neighbors = neighbor_counts > 0
+    if not has_neighbors.any():
+        return next_x, dt, jumped
+
+    # One batched forward pass covers every active sample's own table (at
+    # its own time) AND every active sample's neighbor tables -- this is the
+    # single model call that replaces the old one-call-per-sample loop.
+    own_tables = active_x
+    own_times = active_t
+    all_tables = torch.cat([own_tables, torch.cat(neighbor_tables, dim=0)], dim=0)
+    all_times = torch.cat(
+        [own_times, torch.tensor(neighbor_times, dtype=torch.float32)], dim=0
+    )
+    log_h_all = _log_h_batch_multi_time(
+        model, all_tables, all_times, cfg.total_count, cfg.terminal_time
+    )
+    log_h_x = log_h_all[:A]
+    log_h_neighbors = log_h_all[A:]
+
+    segment_ids_t = torch.tensor(segment_ids, dtype=torch.long)
+    log_h_x_per_neighbor = log_h_x[segment_ids_t]
+    log_ratio = log_h_neighbors - log_h_x_per_neighbor
+    log_ratio = torch.clamp(log_ratio, -cfg.log_ratio_clip, cfg.log_ratio_clip)
+    guided_rates = torch.exp(log_q_base + log_ratio)
+
+    total_rate = torch.zeros(A, dtype=torch.float32)
+    total_rate.scatter_add_(0, segment_ids_t, guided_rates)
+
+    all_neighbors_flat = torch.cat(neighbor_tables, dim=0)
+    offset = 0
+    for i in range(A):
+        c = int(neighbor_counts[i].item())
+        if c == 0:
+            continue
+        rate_i = float(total_rate[i].item())
+        if rate_i > 0:
+            dt[i] = sample_exponential(rate_i, generator=generator)
+            probs_i = guided_rates[offset : offset + c] / rate_i
+            idx = torch.multinomial(probs_i, num_samples=1, generator=generator).item()
+            next_x[i] = all_neighbors_flat[offset + idx]
+            jumped[i] = True
+        offset += c
+
+    return next_x, dt, jumped
+
+
+def simulate_guided_trajectories_batched(
+    x_start: Tensor,
+    model: HModel,
+    cfg: Config,
+    generator: Optional[torch.Generator] = None,
+) -> List[GuidedSampleResult]:
+    """Simulate many independent guided-CTMC trajectories together, backward T->0.
+
+    Semantically equivalent to calling simulate_guided_trajectory once per
+    row of x_start (each trajectory has its own clock and stopping time),
+    but every model forward pass is batched across all samples that are
+    still active at that outer-loop iteration -- see _guided_batch_step.
+    This is what makes many-sample guided sampling fast: previously each of
+    the num_samples trajectories issued its own sequence of ~terminal_time /
+    max_time_step model calls one at a time.
+
+    Args:
+        x_start: (S, m, n) independent starting tables at t=T.
+
+    Returns:
+        list of S GuidedSampleResult, in the same order as x_start.
+    """
+    S = x_start.shape[0]
+    x = x_start.clone()
+    t = torch.full((S,), cfg.terminal_time, dtype=torch.float32)
+    num_jumps = torch.zeros(S, dtype=torch.long)
+    active = torch.ones(S, dtype=torch.bool)
+
+    pbar = tqdm(total=S, desc="simulate_guided_batch[vectorized]")
+    done_count = 0
+
+    while active.any():
+        idx = torch.nonzero(active, as_tuple=False).view(-1)
+        active_x = x[idx]
+        active_t = t[idx]
+
+        next_x, dt, jumped = _guided_batch_step(
+            active_x, active_t, model, cfg, generator=generator
+        )
+        capped_dt = torch.minimum(
+            torch.minimum(dt, torch.full_like(dt, cfg.max_time_step)), active_t
+        )
+
+        take_jump = (dt <= capped_dt + 1e-12) & jumped & (active_t - dt >= 0.0)
+
+        new_x = torch.where(take_jump.unsqueeze(-1).unsqueeze(-1), next_x, active_x)
+        new_t = torch.where(take_jump, active_t - dt, active_t - capped_dt)
+
+        x[idx] = new_x
+        t[idx] = new_t
+        num_jumps[idx] += take_jump.long()
+
+        newly_done = idx[new_t <= 0.0]
+        if newly_done.numel() > 0:
+            active[newly_done] = False
+            done_count += newly_done.numel()
+            pbar.update(newly_done.numel())
+
+    pbar.close()
+
+    return [
+        GuidedSampleResult(
+            terminal_table=x[i], num_jumps=int(num_jumps[i].item())
+        )
+        for i in range(S)
+    ]
+
+
+@dataclass
+class ThinningDiagnostics:
+    """Running counters for the batched thinning/rejection sampler.
+
+    Accumulated across an entire simulate_guided_trajectories_thinning call
+    (all trajectories, all steps) so the caller can sanity-check how much
+    work thinning actually did relative to the exhaustive alternative.
+    """
+
+    num_proposed: int = 0  # total candidate proposals generated (all chunks)
+    num_evaluated: int = 0  # total candidates actually scored by the model
+    num_rejected: int = 0  # evaluated candidates whose Bernoulli test failed
+    num_accepted_jumps: int = 0  # proposals that were the FIRST accept in their window (i.e. actual jumps taken)
+    num_model_calls: int = 0  # number of batched model forward calls issued
+
+    def summary(self) -> str:
+        return (
+            f"[thinning diagnostics] proposed={self.num_proposed} "
+            f"evaluated={self.num_evaluated} rejected={self.num_rejected} "
+            f"accepted_jumps={self.num_accepted_jumps} "
+            f"model_calls={self.num_model_calls}"
+        )
+
+
+_H_EVAL_FLOOR = 1e-8
+
+
+def _h_batch_multi_time(
+    model: HModel,
+    tables: Tensor,
+    times: Tensor,
+    total_count: int,
+    terminal_time: float,
+    eval_batch_size: int = _LOG_H_EVAL_BATCH_SIZE,
+) -> Tensor:
+    """Like _log_h_batch_multi_time, but returns h_theta = sigmoid(logit)
+    directly (not log h) -- the thinning sampler's acceptance probability
+    and dominating-rate normalization both need h_theta itself, per the
+    exact-thinning construction (see simulate_guided_trajectories_thinning),
+    not its log.
+    """
+    device = next(model.parameters()).device
+    B = tables.shape[0]
+
+    chunks: List[Tensor] = []
+    with torch.no_grad():
+        for start in range(0, B, eval_batch_size):
+            end = min(start + eval_batch_size, B)
+            chunk_tables = (tables[start:end].to(device)) / total_count
+            chunk_time = (times[start:end].to(device)) / terminal_time
+            chunks.append(model.forward(chunk_tables, chunk_time).cpu())
+    return torch.cat(chunks, dim=0)
+
+
+def _sample_candidate_moves(
+    positive_counts: Tensor,
+    positive_lists: List[Tensor],
+    d: int,
+    num_proposals: Tensor,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Sample (trajectory_id, src_cell, dst_cell) for a batch of proposals.
+
+    For trajectory i, ``num_proposals[i]`` proposals are drawn, each with
+    src uniform over that trajectory's positive cells (from
+    ``positive_lists[i]``, of length ``positive_counts[i]``) and dst uniform
+    over the other d-1 cells (src excluded).
+
+    Returns:
+        (traj_id, src, dst): 1-D LongTensors, one entry per proposal, in
+        trajectory-major order (all of trajectory 0's proposals, then all of
+        trajectory 1's, ...) -- callers that need chronological order within
+        a trajectory rely on the CALLER's arrival-time sort, not this order.
+    """
+    A = num_proposals.shape[0]
+    traj_id_parts: List[Tensor] = []
+    src_parts: List[Tensor] = []
+    dst_parts: List[Tensor] = []
+
+    for i in range(A):
+        k = int(num_proposals[i].item())
+        if k == 0:
+            continue
+        pos_i = positive_lists[i]
+        P_i = pos_i.shape[0]
+
+        src_choice = torch.randint(0, P_i, (k,), generator=generator)
+        src_cells = pos_i[src_choice]
+
+        # dst uniform over the OTHER d-1 cells: draw uniform in [0, d-2],
+        # then shift indices >= src up by one to skip src itself.
+        dst_choice = torch.randint(0, d - 1, (k,), generator=generator)
+        dst_cells = dst_choice + (dst_choice >= src_cells).long()
+
+        traj_id_parts.append(torch.full((k,), i, dtype=torch.long))
+        src_parts.append(src_cells)
+        dst_parts.append(dst_cells)
+
+    if not traj_id_parts:
+        empty = torch.empty((0,), dtype=torch.long)
+        return empty, empty, empty
+
+    return (
+        torch.cat(traj_id_parts, dim=0),
+        torch.cat(src_parts, dim=0),
+        torch.cat(dst_parts, dim=0),
+    )
+
+
+def _thinning_batch_step(
+    active_x: Tensor,
+    active_t: Tensor,
+    model: HModel,
+    cfg: Config,
+    diagnostics: ThinningDiagnostics,
+    generator: Optional[torch.Generator] = None,
+    proposals_per_chunk: int = 256,
+    max_chunks: int = 64,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Exact batched thinning/rejection step, replacing exhaustive enumeration.
+
+    For each active trajectory x at time t, let d = m*n, P = number of
+    positive cells in x, D = P*(d-1) the number of valid neighbors, and
+    q = ctmc_rate / K the existing base per-pair rate. Writing
+    h_x = h_theta(t, x) (floored away from 0 for numerical safety), the
+    dominating proposal rate is
+
+        Lambda_bar = D * q / h_x
+
+    Proposals arrive as a Poisson process at rate Lambda_bar; each proposal
+    samples a candidate neighbor y uniformly among the D valid neighbors
+    (src uniform over positive cells, dst uniform over the other d-1 cells)
+    and is accepted with probability h_y = h_theta(t, y). This is exact
+    relative to the piecewise-constant-rate approximation already used by
+    the exhaustive sampler, because the accepted rate for landing on any
+    particular neighbor y works out to
+
+        Lambda_bar * (1/D) * h_y = (D*q/h_x) * (1/D) * h_y = q * h_y / h_x
+
+    which is exactly the guided rate q * h_theta(t,y)/h_theta(t,x) used by
+    the exhaustive path -- see guided_step's docstring. The first accepted
+    proposal (in chronological/arrival-time order) within the current
+    max_time_step window is the jump taken; later proposals in the same
+    window are discarded since the state has already changed. If no
+    proposal in a chunk is accepted before the window boundary, another
+    chunk of proposals is drawn.
+
+    Never calls all_neighbors -- candidate tables are built directly from
+    sampled (src, dst) pairs.
+
+    Returns:
+        (next_x, dt, jumped): same per-sample contract as _guided_batch_step.
+    """
+    A = active_x.shape[0]
+    d = cfg.m * cfg.n
+    K = num_ordered_pairs(cfg.m, cfg.n)
+    q = cfg.ctmc_rate / K
+    device_cpu = torch.device("cpu")
+
+    flat_x = active_x.reshape(A, d)
+    positive_lists = [
+        torch.nonzero(flat_x[i] > 0, as_tuple=False).view(-1) for i in range(A)
+    ]
+    positive_counts = torch.tensor(
+        [p.shape[0] for p in positive_lists], dtype=torch.float32
+    )
+    # Dense (A, max_P) padded positive-cell index table, built once per call
+    # (positive cells are fixed for the duration of this window -- a jump
+    # resolves and exits its trajectory rather than changing them mid-loop)
+    # so per-chunk src sampling below can be a single vectorized gather
+    # instead of a Python loop over proposals.
+    max_P = int(positive_counts.max().item()) if A > 0 else 0
+    positive_padded = torch.zeros((A, max_P), dtype=torch.long)
+    for i in range(A):
+        positive_padded[i, : positive_lists[i].shape[0]] = positive_lists[i]
+
+    # h_x for every active trajectory's OWN current table, at its own time.
+    h_x = _h_batch_multi_time(
+        model, active_x, active_t, cfg.total_count, cfg.terminal_time
+    )
+    diagnostics.num_evaluated += A
+    diagnostics.num_model_calls += 1
+    h_x_floored = torch.clamp(h_x, min=_H_EVAL_FLOOR)
+
+    D = positive_counts * (d - 1)
+    lambda_bar = D * q / h_x_floored  # (A,)
+
+    next_x = active_x.clone()
+    dt = torch.full((A,), cfg.max_time_step, dtype=torch.float32)
+    jumped = torch.zeros(A, dtype=torch.bool)
+
+    remaining_window = torch.minimum(
+        torch.full((A,), cfg.max_time_step, dtype=torch.float32), active_t
+    )
+    # window_end[i]: elapsed-time boundary (from the start of this call) at
+    # which trajectory i's rates must be refreshed regardless of acceptance.
+    window_end = remaining_window.clone()
+
+    resolved = torch.zeros(A, dtype=torch.bool)  # trajectory decided this call
+    resolved[D <= 0] = True  # degenerate: no positive cells at all (shouldn't occur for total_count > 0)
+    elapsed_offset = torch.zeros(A, dtype=torch.float32)  # start-of-chunk elapsed time, per trajectory
+
+    for _chunk in range(max_chunks):
+        pending = torch.nonzero(~resolved, as_tuple=False).view(-1)
+        if pending.numel() == 0:
+            break
+
+        k = proposals_per_chunk
+        num_proposals = torch.full((pending.numel(),), k, dtype=torch.long)
+
+        # Per-trajectory exponential interarrival times -> cumulative
+        # arrival times (elapsed since the start of THIS chunk).
+        rates_pending = lambda_bar[pending]
+        u = torch.rand((pending.numel(), k), generator=generator)
+        u = torch.clamp(u, max=1.0 - 1e-12)
+        interarrival = -torch.log1p(-u) / rates_pending.unsqueeze(-1)
+        arrival_times = torch.cumsum(interarrival, dim=1)  # (P, k), elapsed within chunk
+        abs_arrival_times = (
+            elapsed_offset[pending].unsqueeze(-1) + arrival_times
+        )  # elapsed since window start
+
+        within_window = abs_arrival_times <= window_end[pending].unsqueeze(-1)
+
+        # Flatten to (traj_local, proposal_rank) pairs that fall within the
+        # window, preserving chronological order per trajectory (arrival
+        # times are already increasing along dim=1 since they're a cumsum).
+        local_idx, rank_idx = torch.nonzero(within_window, as_tuple=True)
+        num_this_chunk_proposed = local_idx.numel()
+        diagnostics.num_proposed += k * pending.numel()
+
+        if num_this_chunk_proposed == 0:
+            # No proposal in this chunk falls within the remaining window for
+            # any pending trajectory -> those trajectories are resolved with
+            # no jump (advance to the window boundary).
+            resolved[pending] = True
+            continue
+
+        traj_of_proposal = pending[local_idx]  # (M,) index into active_x/active_t
+        P_per_proposal = positive_counts[traj_of_proposal].long()  # (M,)
+
+        # Vectorized "uniform integer in [0, P_i)" per proposal row: draw a
+        # continuous uniform and floor-scale by that row's own P_i, then
+        # gather from the padded positive-cell table -- avoids a Python
+        # loop over proposals (M can be in the thousands per chunk).
+        u_src = torch.rand(num_this_chunk_proposed, generator=generator)
+        src_choice = torch.clamp(
+            (u_src * P_per_proposal.to(torch.float32)).long(), max=P_per_proposal - 1
+        )
+        src_cells = positive_padded[traj_of_proposal, src_choice]
+
+        dst_choice = torch.randint(0, d - 1, (num_this_chunk_proposed,), generator=generator)
+        dst_cells = dst_choice + (dst_choice >= src_cells).long()
+
+        candidate_tables = flat_x[traj_of_proposal].clone()
+        row_arange = torch.arange(num_this_chunk_proposed)
+        candidate_tables[row_arange, src_cells] -= 1
+        candidate_tables[row_arange, dst_cells] += 1
+        candidate_tables_2d = candidate_tables.view(num_this_chunk_proposed, cfg.m, cfg.n)
+
+        candidate_times = active_t[traj_of_proposal]
+        h_y = _h_batch_multi_time(
+            model, candidate_tables_2d, candidate_times, cfg.total_count, cfg.terminal_time
+        )
+        diagnostics.num_evaluated += num_this_chunk_proposed
+        diagnostics.num_model_calls += 1
+
+        accept_u = torch.rand(num_this_chunk_proposed, generator=generator)
+        accepted = accept_u <= h_y
+        diagnostics.num_rejected += int((~accepted).sum().item())
+
+        proposal_abs_time = abs_arrival_times[local_idx, rank_idx]
+
+        # For each pending trajectory, find its FIRST accepted proposal
+        # (lowest abs arrival time among accepted==True) in this chunk.
+        for j_local in range(pending.numel()):
+            traj_global = int(pending[j_local].item())
+            if resolved[traj_global]:
+                continue
+            mask = (traj_of_proposal == pending[j_local]) & accepted
+            if not mask.any():
+                continue
+            times_this_traj = torch.where(
+                mask, proposal_abs_time, torch.full_like(proposal_abs_time, float("inf"))
+            )
+            best = torch.argmin(times_this_traj)
+            chosen_time = float(times_this_traj[best].item())
+            if chosen_time <= float(window_end[traj_global].item()) + 1e-12:
+                next_x[traj_global] = candidate_tables_2d[best]
+                dt[traj_global] = chosen_time
+                jumped[traj_global] = True
+                diagnostics.num_accepted_jumps += 1
+                resolved[traj_global] = True
+
+        # Trajectories with no acceptance this chunk continue to the next
+        # chunk, with elapsed_offset advanced past everything just drawn.
+        still_pending = torch.nonzero(~resolved, as_tuple=False).view(-1)
+        for ti in still_pending.tolist():
+            local_matches = (traj_of_proposal == ti)
+            if local_matches.any():
+                last_time = float(proposal_abs_time[local_matches].max().item())
+                elapsed_offset[ti] = max(elapsed_offset[ti].item(), last_time)
+            if elapsed_offset[ti].item() >= float(window_end[ti].item()):
+                resolved[ti] = True
+
+    # Anything still unresolved after max_chunks: treat as no-jump within
+    # the window (advance to the boundary) -- this should be rare given
+    # geometric-in-chunks probability of continued rejection.
+    return next_x, dt, jumped
+
+
+def simulate_guided_trajectories_thinning(
+    x_start: Tensor,
+    model: HModel,
+    cfg: Config,
+    generator: Optional[torch.Generator] = None,
+    proposals_per_chunk: int = 256,
+) -> Tuple[List[GuidedSampleResult], ThinningDiagnostics]:
+    """Simulate many guided-CTMC trajectories via exact batched thinning.
+
+    Drop-in alternative to simulate_guided_trajectories_batched: same
+    per-trajectory semantics (independent clock, backward T->0, same
+    GuidedSampleResult output, same piecewise-constant-rate refresh every
+    cfg.max_time_step), but avoids ever enumerating the full neighbor set
+    (all_neighbors) via exact thinning/rejection -- see
+    _thinning_batch_step for the construction and its exactness argument.
+
+    Returns:
+        (results, diagnostics): results in the same order as x_start;
+        diagnostics accumulates proposal/evaluation/rejection/jump/model-call
+        counts across the whole run (see ThinningDiagnostics).
+    """
+    S = x_start.shape[0]
+    x = x_start.clone()
+    t = torch.full((S,), cfg.terminal_time, dtype=torch.float32)
+    num_jumps = torch.zeros(S, dtype=torch.long)
+    active = torch.ones(S, dtype=torch.bool)
+    diagnostics = ThinningDiagnostics()
+
+    pbar = tqdm(total=S, desc="simulate_guided_batch[thinning]")
+
+    while active.any():
+        idx = torch.nonzero(active, as_tuple=False).view(-1)
+        active_x = x[idx]
+        active_t = t[idx]
+
+        next_x, dt, jumped = _thinning_batch_step(
+            active_x,
+            active_t,
+            model,
+            cfg,
+            diagnostics,
+            generator=generator,
+            proposals_per_chunk=proposals_per_chunk,
+        )
+        capped_dt = torch.minimum(
+            torch.minimum(dt, torch.full_like(dt, cfg.max_time_step)), active_t
+        )
+
+        take_jump = (dt <= capped_dt + 1e-12) & jumped & (active_t - dt >= 0.0)
+
+        new_x = torch.where(take_jump.unsqueeze(-1).unsqueeze(-1), next_x, active_x)
+        new_t = torch.where(take_jump, active_t - dt, active_t - capped_dt)
+
+        x[idx] = new_x
+        t[idx] = new_t
+        num_jumps[idx] += take_jump.long()
+
+        newly_done = idx[new_t <= 0.0]
+        if newly_done.numel() > 0:
+            active[newly_done] = False
+            pbar.update(newly_done.numel())
+
+    pbar.close()
+
+    results = [
+        GuidedSampleResult(
+            terminal_table=x[i], num_jumps=int(num_jumps[i].item())
+        )
+        for i in range(S)
+    ]
+    return results, diagnostics
 
 
 @dataclass
@@ -393,6 +977,7 @@ def simulate_guided_batch(
     num_samples: int,
     seed: Optional[int] = None,
     init_mode: str = "rejection",
+    method: str = "thinning",
 ) -> List[GuidedSampleResult]:
     """Generate ``num_samples`` independent guided trajectories, backward T->0.
 
@@ -401,6 +986,22 @@ def simulate_guided_batch(
     "rejection", the correctness-preserving exact initialization -- pass
     init_mode="uniform_fallback" only when h_theta(T,.) has been verified
     approximately constant, see check_h_constant_at_T).
+
+    All num_samples trajectories are simulated together, batching the model
+    forward pass across every sample still active at each step (rather than
+    issuing one full sequence of model calls per sample, one sample at a
+    time). Two interchangeable methods, selected via ``method``:
+
+    - "thinning" (default): simulate_guided_trajectories_thinning, exact
+      batched thinning/rejection that never enumerates the full neighbor
+      set (see its docstring for the exactness argument). Much cheaper per
+      step when a table has many positive cells, since it evaluates only as
+      many candidates as needed to find an acceptance rather than all ~D
+      neighbors every refresh.
+    - "exhaustive": simulate_guided_trajectories_batched, the original
+      reference implementation that enumerates and scores every valid
+      neighbor each refresh. Kept for validation/comparison against the
+      thinning path (see test_sample_guided.py).
     """
     seed = cfg.seed if seed is None else seed
     generator = torch.Generator()
@@ -418,13 +1019,18 @@ def simulate_guided_batch(
         f"mean_h_accepted={init_result.mean_h_accepted:.6f}"
     )
 
-    results = []
-    for i in tqdm(range(num_samples), desc="simulate_guided_batch"):
-        x_start = init_result.x_start_samples[i]
-        results.append(
-            simulate_guided_trajectory(x_start, model, cfg, generator=generator)
+    if method == "thinning":
+        results, diagnostics = simulate_guided_trajectories_thinning(
+            init_result.x_start_samples, model, cfg, generator=generator
         )
-    return results
+        print(diagnostics.summary())
+        return results
+    elif method == "exhaustive":
+        return simulate_guided_trajectories_batched(
+            init_result.x_start_samples, model, cfg, generator=generator
+        )
+    else:
+        raise ValueError(f"Unknown method {method!r}, expected 'thinning' or 'exhaustive'")
 
 
 def summarize_guided_samples(results: List[GuidedSampleResult], cfg: Config) -> str:
