@@ -1,20 +1,3 @@
-"""MLP model for h_theta(t, X_t), the soft-terminal-reward predictor.
-
-Input: the *already normalized* table X_t / N (flattened) concatenated with
-normalized time t / T (a single scalar). Normalization is performed
-upstream (see h_dataset.py) -- this module expects pre-normalized inputs and
-does not renormalize.
-
-Architecture (fixed by spec):
-    input dim = m*n + 1
-    4 hidden layers of width 126, each followed by SiLU
-    output dim = 1 (a scalar logit)
-
-h_theta(t, x) = sigmoid(logit) in (0, 1). Use forward_logits(...) to get the
-raw logit (for numerically stable log(h) via F.logsigmoid), and forward(...)
-to get h itself.
-"""
-
 from __future__ import annotations
 
 import torch

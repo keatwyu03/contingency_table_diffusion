@@ -17,10 +17,10 @@ class Config:
 
     # --- CTMC parameters --------------------------------------------------
     terminal_time: float = 1.0
-    ctmc_rate: float = 50000.0
+    ctmc_rate: float = 100.0
 
     # --- Reward parameters --------------------------------------------------
-    reward_gamma: float = 0.02
+    reward_gamma: float = 0.0035
 
     # --- Network architecture --------------------------------------------
     hidden_width: int = 126
@@ -61,6 +61,7 @@ class Config:
     checkpoint_dir: str = "checkpoints"
     output_dir: str = "outputs"
     dataset_path: str = "outputs/h_dataset.pt"
+    results_dir: str = "results"
 
     def __post_init__(self) -> None:
         if self.m <= 0 or self.n <= 0:
@@ -97,9 +98,10 @@ class Config:
             )
 
     def ensure_dirs(self) -> None:
-        """Create checkpoint/output directories if they do not exist."""
+        """Create checkpoint/output/results directories if they do not exist."""
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
 
     def summary(self) -> str:
         """Return a human-readable summary of the resolved configuration."""

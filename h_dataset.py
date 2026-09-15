@@ -1,12 +1,24 @@
-"""Dataset generation for training h_theta(t, X_t).
+"""Dataset generation for training h_theta(t, X_t) under the forward-noising
+/ reverse-guidance orientation.
 
-For each unconditional CTMC trajectory started from a fixed starting table,
-we simulate from 0 to T, record several intermediate (t, X_t) snapshots, and
-compute a single terminal soft reward R(X_T) = exp(-gamma * S_2(X_T)). Every
-snapshot from that trajectory is paired with the *same* terminal target,
-since R(X_T) is a Monte-Carlo target for E[R(X_T) | X_t] and each trajectory
-contributes one unbiased sample of that conditional expectation at every t
-along its own path.
+Convention: X_0 is the original (clean) table, X_t is its forward-noised
+version at time t (via the existing unconditional CTMC), and X_T is the
+fully noised terminal table. Training runs forward in time (0 -> T);
+guided sampling (see sample_guided.py) runs backward (T -> 0), recovering
+an approximate X_0.
+
+The network target is
+
+    h_theta(t, X_t) ~= E[R(X_0) | X_t]
+
+where R(X_0) = exp(-gamma * S_2(X_0)) is the soft reward of the ORIGINAL
+table the forward noising started from -- NOT the reward of X_t itself, and
+NOT the reward of some future continuation of the chain past t. This is a
+different target than the old "terminal reward of a trajectory run forward
+from a fixed start" scheme: here every training pair (t, X_t) is generated
+by first drawing X_0 ~ Uniform(E_N), computing R(X_0) once, then running the
+forward CTMC from X_0 for a SHORT time tau (not out to T), and pairing
+X_tau with the already-known R(X_0).
 
 Normalization convention (see also h_model.py): tables are normalized by
 dividing by N = total_count, and time is normalized by dividing by T =
@@ -23,23 +35,32 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from config import Config
-from ctmc import simulate_trajectory, table_at_time
+from ctmc import simulate_trajectory
 from table_space import sample_uniform_tables, squared_margin_error, soft_reward
 
 
 @dataclass
 class HDatasetSample:
-    """A single training example for h_theta."""
+    """A single training example for h_theta.
 
-    current_table: Tensor  # (m, n), normalized by N
-    time: float  # normalized by T, in [0, 1]
-    terminal_reward: float  # R(X_T) in (0, 1]
+    original_table and original_sample_id are diagnostics/bookkeeping only
+    (used to verify the target and to split train/val by original sample so
+    that no X_0's observations leak across the split) -- they are not model
+    inputs. The model sees only (current_table, time).
+    """
+
+    current_table: Tensor  # X_tau, (m, n), normalized by N
+    time: float  # tau, normalized by T, in [0, 1]
+    original_reward: float  # R(X_0) in (0, 1] -- the training target
+    original_table: Tensor  # X_0, (m, n), normalized by N -- diagnostic only
+    original_sample_id: int  # groups all (tau, X_tau) drawn from the same X_0
 
 
 class HDataset(Dataset):
-    """In-memory dataset of (normalized table, normalized time, terminal reward)."""
+    """Dataset of (X_tau, tau, R(X_0)) triples, grouped by original_sample_id."""
 
     def __init__(self, samples: List[HDatasetSample]):
         self.samples = samples
@@ -50,7 +71,7 @@ class HDataset(Dataset):
     def __getitem__(self, idx: int):
         s = self.samples[idx]
         return s.current_table, torch.tensor(s.time, dtype=torch.float32), torch.tensor(
-            s.terminal_reward, dtype=torch.float32
+            s.original_reward, dtype=torch.float32
         )
 
     def save(self, path: str) -> None:
@@ -58,18 +79,39 @@ class HDataset(Dataset):
         tables = torch.stack([s.current_table for s in self.samples], dim=0)
         times = torch.tensor([s.time for s in self.samples], dtype=torch.float32)
         rewards = torch.tensor(
-            [s.terminal_reward for s in self.samples], dtype=torch.float32
+            [s.original_reward for s in self.samples], dtype=torch.float32
         )
-        torch.save({"tables": tables, "times": times, "rewards": rewards}, path)
+        original_tables = torch.stack(
+            [s.original_table for s in self.samples], dim=0
+        )
+        sample_ids = torch.tensor(
+            [s.original_sample_id for s in self.samples], dtype=torch.int64
+        )
+        torch.save(
+            {
+                "tables": tables,
+                "times": times,
+                "rewards": rewards,
+                "original_tables": original_tables,
+                "sample_ids": sample_ids,
+            },
+            path,
+        )
 
     @staticmethod
     def load(path: str) -> "HDataset":
         """Load a dataset previously saved with .save()."""
         blob = torch.load(path)
         tables, times, rewards = blob["tables"], blob["times"], blob["rewards"]
+        original_tables = blob["original_tables"]
+        sample_ids = blob["sample_ids"]
         samples = [
             HDatasetSample(
-                current_table=tables[i], time=float(times[i]), terminal_reward=float(rewards[i])
+                current_table=tables[i],
+                time=float(times[i]),
+                original_reward=float(rewards[i]),
+                original_table=original_tables[i],
+                original_sample_id=int(sample_ids[i]),
             )
             for i in range(tables.shape[0])
         ]
@@ -78,33 +120,50 @@ class HDataset(Dataset):
 
 def generate_h_dataset(
     cfg: Config,
-    num_trajectories: Optional[int] = None,
-    num_time_samples_per_trajectory: Optional[int] = None,
+    num_original_samples: Optional[int] = None,
+    num_time_samples_per_original: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> HDataset:
-    """Generate an offline dataset of (t, X_t, R(X_T)) triples.
+    """Generate an offline dataset of (tau, X_tau, R(X_0)) triples.
 
-    Each trajectory starts from an independent X_0 ~ Uniform(E_N), drawn via
-    exact stars-and-bars sampling (table_space.sample_uniform_tables) -- NOT
-    from a single fixed deterministic table. This matches the agreed
-    procedure X_0 ~ Uniform(E_N) so h_theta is trained on trajectories that
-    start spread across the whole table space rather than all funneling
-    through one corner of it.
+    For each independent original sample:
+      1. Draw X_0 ~ Uniform(E_N) via exact stars-and-bars.
+      2. Compute S_2(X_0) and R(X_0) = exp(-gamma * S_2(X_0)) immediately --
+         this is the training target for every (tau, X_tau) drawn below, and
+         does NOT depend on any future continuation of the chain.
+      3. For num_time_samples_per_original draws of tau ~ Uniform(0, T)
+         (including explicit tau=0 and tau=T observations, see below), run
+         the unconditional forward CTMC from X_0 to time tau to obtain
+         X_tau, and store (X_tau, tau, R(X_0)).
+
+    We deliberately do NOT simulate from X_tau onward to T to derive a
+    label -- that was the previous ("terminal reward of a forward
+    continuation") scheme and is removed here. Each tau requires its own
+    short forward simulation from X_0 to tau (independent noise draws), so
+    unlike the previous scheme this does not reuse a single stored path
+    across multiple tau values from the same X_0.
+
+    Explicit boundary observations:
+      - tau=0 observations (X_0, 0, R(X_0)) teach the boundary identity
+        h_theta(0, x) = R(x) exactly.
+      - tau=T observations are included as diagnostics for whether
+        h_theta(T, x) has become approximately constant (full mixing).
 
     Args:
         cfg: resolved Config.
-        num_trajectories: overrides cfg.num_trajectories if given.
-        num_time_samples_per_trajectory: overrides cfg if given.
+        num_original_samples: overrides cfg.num_trajectories if given (kept
+            as num_trajectories in Config for backward-compatible naming;
+            it counts independent X_0 draws here, not full trajectories).
+        num_time_samples_per_original: overrides cfg.num_time_samples_per_trajectory.
         seed: overrides cfg.seed if given.
 
     Returns:
-        An HDataset with N = num_trajectories * num_time_samples_per_trajectory
-        samples (each trajectory contributes exactly that many snapshots, all
-        sharing the same terminal reward target).
+        An HDataset with num_original_samples * num_time_samples_per_original
+        rows, grouped by original_sample_id for split-safe train/val division.
     """
-    num_trajectories = num_trajectories or cfg.num_trajectories
+    num_original_samples = num_original_samples or cfg.num_trajectories
     num_time_samples = (
-        num_time_samples_per_trajectory or cfg.num_time_samples_per_trajectory
+        num_time_samples_per_original or cfg.num_time_samples_per_trajectory
     )
     seed = cfg.seed if seed is None else seed
 
@@ -116,47 +175,44 @@ def generate_h_dataset(
 
     samples: List[HDatasetSample] = []
 
-    for _ in range(num_trajectories):
-        start_table = sample_uniform_tables(
+    for original_sample_id in tqdm(
+        range(num_original_samples), desc="generate_h_dataset[original samples]"
+    ):
+        x0 = sample_uniform_tables(
             1, cfg.m, cfg.n, cfg.total_count, generator=generator
         ).squeeze(0)
 
-        # Simulate once, storing the entire jump path (see SimulationResult
-        # in ctmc.py). Intermediate observation times are then drawn and
-        # looked up from that single stored path -- no re-simulation.
-        result = simulate_trajectory(
-            start_table,
-            cfg.terminal_time,
-            cfg.ctmc_rate,
-            generator=generator,
-        )
+        s2_x0 = squared_margin_error(x0.unsqueeze(0), target_rows, target_cols).squeeze(0)
+        r_x0 = float(soft_reward(s2_x0, cfg.reward_gamma).item())
+        x0_normalized = x0 / cfg.total_count
 
-        terminal_table = result.terminal_table
-        s2_terminal = squared_margin_error(
-            terminal_table.unsqueeze(0), target_rows, target_cols
-        ).squeeze(0)
-        r_terminal = float(soft_reward(s2_terminal, cfg.reward_gamma).item())
+        # tau values: explicit 0 and T, plus uniform interior draws for the rest.
+        num_interior = max(num_time_samples - 2, 0)
+        interior_taus = torch.rand(num_interior, generator=generator) * cfg.terminal_time
+        taus = torch.cat(
+            [
+                torch.tensor([0.0]),
+                interior_taus,
+                torch.tensor([cfg.terminal_time]),
+            ]
+        )[:num_time_samples]
 
-        # Sample intermediate times uniformly in (0, T), then sort; always
-        # include T itself so the snapshot at t=T is available for the
-        # optional boundary loss.
-        interior_times = torch.rand(
-            max(num_time_samples - 1, 0), generator=generator
-        ) * cfg.terminal_time
-        times = torch.cat(
-            [interior_times, torch.tensor([cfg.terminal_time])]
-        )
-        times, _ = torch.sort(times)
+        for tau in taus.tolist():
+            if tau <= 0.0:
+                x_tau = x0
+            else:
+                result = simulate_trajectory(
+                    x0, tau, cfg.ctmc_rate, generator=generator
+                )
+                x_tau = result.terminal_table
 
-        for t in times.tolist():
-            table_t = table_at_time(result.path, t, cfg.terminal_time)
-            normalized_table = table_t / cfg.total_count
-            normalized_time = t / cfg.terminal_time
             samples.append(
                 HDatasetSample(
-                    current_table=normalized_table,
-                    time=normalized_time,
-                    terminal_reward=r_terminal,
+                    current_table=x_tau / cfg.total_count,
+                    time=tau / cfg.terminal_time,
+                    original_reward=r_x0,
+                    original_table=x0_normalized,
+                    original_sample_id=original_sample_id,
                 )
             )
 

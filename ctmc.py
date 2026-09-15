@@ -1,30 +1,3 @@
-"""Unconditional symmetric CTMC over the contingency-table space E_N.
-
-State space: E_N = { x in Z_{>=0}^{m x n} : sum x_{ij} = N }.
-
-Transition mechanism: at each proposal, an ordered pair of distinct cells
-(source, destination) is chosen uniformly at random from all d*(d-1)
-ordered pairs, where d = m*n. If the source cell is positive, one unit of
-mass moves from source to destination. If the source cell is zero, the
-proposal is *rejected* and the table is unchanged -- but simulated time
-still advances by the sampled waiting time.
-
-Proposals arrive at constant rate ``ctmc_rate``; waiting times between
-proposals are drawn i.i.d. from Exponential(ctmc_rate), independent of the
-proposal outcome. Consequently every valid off-diagonal transition x -> y
-(y reachable from x by one such move) has the same rate
-
-    q(x, y) = ctmc_rate / K,   K = d * (d - 1)
-
-so the unconditional chain is symmetric: q(x, y) = q(y, x) whenever y is
-reachable from x by moving mass from cell a to cell b, since the reverse
-move (b -> a) is an equally likely ordered pair and is valid on y (because
-y has positive mass at cell a, the destination that just received it... note
-validity of the *reverse* move requires that x had positive mass at the
-original destination is irrelevant; validity of moving b->a on y requires
-y[b] > 0, which holds since y = x with one unit moved into b).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -32,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 from table_space import (
     all_neighbors,
@@ -44,27 +18,12 @@ from table_space import (
 
 @dataclass
 class TrajectorySnapshot:
-    """A single recorded (time, table) pair along a trajectory."""
-
     time: float
     table: Tensor
 
 
 @dataclass
 class SimulationResult:
-    """Result of simulating one CTMC trajectory to terminal time T.
-
-    ``path`` records the *entire* trajectory as one entry per accepted jump:
-    ``path[k] = (t_k, x_k)`` where ``x_k`` is the table that is current
-    starting at time ``t_k`` (i.e. the state immediately after the k-th
-    accepted jump; ``path[0]`` is always ``(0.0, x0)``). Rejected proposals
-    are not recorded since they do not change the table -- the state at any
-    query time ``t`` is simply the table from the last path entry with
-    ``t_k <= t`` (see ``table_at_time``). Storing the full path lets callers
-    (e.g. h_dataset.py) sample as many intermediate observations as they
-    like from a single simulation run, without re-simulating.
-    """
-
     terminal_table: Tensor
     snapshots: List[TrajectorySnapshot]
     num_jumps: int
@@ -72,13 +31,6 @@ class SimulationResult:
 
 
 def table_at_time(path: List[TrajectorySnapshot], t: float, terminal_time: float) -> Tensor:
-    """Look up the table that is current at time ``t`` from a stored path.
-
-    ``path`` must be sorted by time ascending with ``path[0].time == 0.0``
-    (as produced by ``simulate_trajectory``). Returns the table associated
-    with the last path entry whose time is <= t (binary search over the
-    jump times), i.e. the state that held from that jump until the next one.
-    """
     if t <= 0.0:
         return path[0].table
     if t >= terminal_time:
@@ -98,27 +50,28 @@ def table_at_time(path: List[TrajectorySnapshot], t: float, terminal_time: float
 def sample_exponential(
     rate: float, generator: Optional[torch.Generator] = None, device: str = "cpu"
 ) -> float:
-    """Sample one Exponential(rate) draw, honoring an optional generator.
-
-    ``torch.distributions.Exponential.sample()`` does not accept a
-    ``generator`` argument, so reproducibility must go through the inverse
-    CDF instead: if U ~ Uniform(0, 1) then -ln(1 - U) / rate ~ Exponential(rate).
-    ``torch.rand`` does accept ``generator``, so this ties the draw to the
-    caller's RNG state exactly like every other sampling call in this module.
-    """
     u = torch.rand((), generator=generator, device=device)
     # Clamp away from 1.0 to avoid log(0) in the (measure-zero) case u == 1.
     u = torch.clamp(u, max=1.0 - 1e-12)
     return float(-torch.log1p(-u) / rate)
 
 
+def sample_exponential_batch(
+    rate: float,
+    batch_n: int,
+    generator: Optional[torch.Generator] = None,
+    device: str = "cpu",
+) -> Tensor:
+    u = torch.rand((batch_n,), generator=generator, device=device)
+    u = torch.clamp(u, max=1.0 - 1e-12)
+    return -torch.log1p(-u) / rate
+
+
 def num_cells(m: int, n: int) -> int:
-    """Return d = m * n, the number of cells."""
     return m * n
 
 
 def num_ordered_pairs(m: int, n: int) -> int:
-    """Return K = d * (d - 1), the number of ordered (source, dest) pairs."""
     d = num_cells(m, n)
     return d * (d - 1)
 
@@ -126,11 +79,6 @@ def num_ordered_pairs(m: int, n: int) -> int:
 def propose_move(
     d: int, generator: Optional[torch.Generator] = None, device: str = "cpu"
 ) -> Tuple[int, int]:
-    """Sample one ordered pair of distinct cells (source, dest) uniformly.
-
-    Returns:
-        (source_flat_idx, dest_flat_idx), source != dest.
-    """
     while True:
         pair = torch.randint(
             0, d, (2,), generator=generator, device=device
@@ -139,13 +87,28 @@ def propose_move(
             return pair[0], pair[1]
 
 
-def apply_move(x: Tensor, source: int, dest: int) -> Tensor:
-    """Apply a single proposed move to flat-indexed cells (source, dest).
+def propose_move_batch(
+    d: int,
+    batch_n: int,
+    generator: Optional[torch.Generator] = None,
+    device: str = "cpu",
+) -> Tuple[List[int], List[int]]:
 
-    If x has positive mass at ``source``, returns a new table with one unit
-    moved from source to dest. Otherwise (source is zero), the proposal is
-    rejected and an unchanged copy of x is returned.
-    """
+    sources = torch.randint(0, d, (batch_n,), generator=generator, device=device)
+    dests = torch.randint(0, d, (batch_n,), generator=generator, device=device)
+
+    collision_mask = sources == dests
+    while collision_mask.any():
+        num_collisions = int(collision_mask.sum().item())
+        dests[collision_mask] = torch.randint(
+            0, d, (num_collisions,), generator=generator, device=device
+        )
+        collision_mask = sources == dests
+
+    return sources.tolist(), dests.tolist()
+
+
+def apply_move(x: Tensor, source: int, dest: int) -> Tensor:
     m, n = x.shape[0], x.shape[1]
     flat = x.reshape(-1).clone()
     if flat[source] > 0:
@@ -162,56 +125,62 @@ def simulate_trajectory(
     generator: Optional[torch.Generator] = None,
     device: str = "cpu",
 ) -> SimulationResult:
-    """Simulate one unconditional CTMC trajectory from x0 to terminal_time.
-
-    Waiting times between successive proposals are drawn i.i.d. from
-    Exponential(ctmc_rate). Each proposal picks a uniformly random ordered
-    pair of distinct cells; if the source is zero, the proposal is rejected
-    (table unchanged) but simulated time still advances by the sampled
-    waiting time, matching a genuine constant-proposal-rate CTMC with
-    self-loops collapsed into rejections.
-
-    Args:
-        x0: starting table, shape (m, n).
-        terminal_time: T, the time horizon to simulate to.
-        ctmc_rate: constant proposal rate (Exponential rate parameter).
-        snapshot_times: optional sequence of times in [0, T] at which to
-            record the table state (looked up from the full stored path
-            after simulation finishes, so this costs no extra simulation
-            work -- see ``table_at_time``). If omitted, ``snapshots`` is
-            empty but ``result.path`` still holds the entire trajectory.
-        generator: optional torch.Generator for reproducibility.
-        device: torch device string.
-
-    Returns:
-        SimulationResult with terminal_table, snapshots (one per requested
-        snapshot time, in order), num_jumps, and the full jump path.
-    """
     m, n = x0.shape[0], x0.shape[1]
     d = num_cells(m, n)
-    x = x0.clone().to(device)
+    flat = x0.reshape(-1).clone().to(device).tolist()
     t = 0.0
     num_jumps = 0
 
-    path: List[TrajectorySnapshot] = [TrajectorySnapshot(time=0.0, table=x.clone())]
+    path: List[TrajectorySnapshot] = [
+        TrajectorySnapshot(time=0.0, table=torch.tensor(flat, device=device).view(m, n))
+    ]
+
+    chunk_size = 4096
+    dts: List[float] = []
+    sources: List[int] = []
+    dests: List[int] = []
+    chunk_idx = 0
+
+    def refill() -> None:
+        nonlocal dts, sources, dests, chunk_idx
+        dts = sample_exponential_batch(
+            ctmc_rate, chunk_size, generator=generator, device=device
+        ).tolist()
+        sources, dests = propose_move_batch(
+            d, chunk_size, generator=generator, device=device
+        )
+        chunk_idx = 0
+
+    refill()
 
     while t < terminal_time:
-        dt = sample_exponential(ctmc_rate, generator=generator, device=device)
-        next_t = t + dt
+        if chunk_idx == chunk_size:
+            refill()
 
+        dt = dts[chunk_idx]
+        source = sources[chunk_idx]
+        dest = dests[chunk_idx]
+        chunk_idx += 1
+
+        next_t = t + dt
         if next_t >= terminal_time:
             t = terminal_time
             break
 
-        source, dest = propose_move(d, generator=generator, device=device)
-        flat = x.reshape(-1)
         if flat[source] > 0:
-            x = apply_move(x, source, dest)
+            flat[source] -= 1
+            flat[dest] += 1
             num_jumps += 1
-            path.append(TrajectorySnapshot(time=next_t, table=x.clone()))
-        # else: rejected proposal, x unchanged (no new path entry needed),
+            path.append(
+                TrajectorySnapshot(
+                    time=next_t, table=torch.tensor(flat, device=device).view(m, n)
+                )
+            )
+        # else: rejected proposal, flat unchanged (no new path entry needed),
         # but time still advances.
         t = next_t
+
+    terminal_table = torch.tensor(flat, dtype=torch.float32, device=device).view(m, n)
 
     snapshots: List[TrajectorySnapshot] = []
     if snapshot_times:
@@ -221,7 +190,7 @@ def simulate_trajectory(
             )
 
     return SimulationResult(
-        terminal_table=x, snapshots=snapshots, num_jumps=num_jumps, path=path
+        terminal_table=terminal_table, snapshots=snapshots, num_jumps=num_jumps, path=path
     )
 
 
@@ -234,15 +203,8 @@ def simulate_batch(
     generator: Optional[torch.Generator] = None,
     device: str = "cpu",
 ) -> List[SimulationResult]:
-    """Generate ``batch_size`` independent trajectories from the same x0.
-
-    Trajectories are simulated independently (each has its own random
-    proposal sequence and waiting times); this is "batched" in the sense of
-    producing many independent trajectories per call, though each individual
-    trajectory's event-driven simulation is inherently sequential.
-    """
     results = []
-    for _ in range(batch_size):
+    for _ in tqdm(range(batch_size), desc="simulate_batch"):
         results.append(
             simulate_trajectory(
                 x0,
@@ -259,24 +221,17 @@ def simulate_batch(
 def validate_trajectory_invariants(
     result: SimulationResult, m: int, n: int, total_count: int
 ) -> None:
-    """Validate nonnegativity and total-count preservation along a trajectory."""
     validate_table(result.terminal_table, m, n, total_count)
     for snap in result.snapshots:
         validate_table(snap.table, m, n, total_count)
 
 
 def forward_rate(ctmc_rate: float, m: int, n: int) -> float:
-    """Return q(x, y) = ctmc_rate / K for any valid off-diagonal transition."""
     K = num_ordered_pairs(m, n)
     return ctmc_rate / K
 
 
 def enumerate_neighbors(x: Tensor):
-    """Enumerate all valid neighboring tables of x and their (src, dst) pairs.
-
-    Thin wrapper around table_space.all_neighbors, re-exported here since the
-    CTMC module is the natural place callers look for "neighbor" utilities.
-    """
     return all_neighbors(x)
 
 
@@ -296,26 +251,6 @@ def calibrate_mixing(
     num_uniform_reference: int = 200,
     seed: int = 0,
 ) -> Dict[str, object]:
-    """Compare terminal CTMC samples against exact uniform samples over E_N.
-
-    For each named starting table in ``start_tables``, simulate
-    ``num_samples_per_start`` independent trajectories to ``terminal_time``
-    and collect terminal states. Also draw ``num_uniform_reference`` exact
-    uniform samples from E_N via stars-and-bars. Report summary statistics
-    to assess how close the CTMC's terminal distribution is to uniform
-    (a proxy for mixing), and how much the terminal distribution still
-    depends on the starting state.
-
-    Returns:
-        A dictionary with per-start and reference summaries:
-          - cellwise_mean, cellwise_var: (m, n) tensors
-          - row_sum_mean, row_sum_var: (m,) tensors
-          - col_sum_mean, col_sum_var: (n,) tensors
-          - zero_count_mean, zero_count_var: scalars (mean/var of number of
-            zero cells per table)
-        plus a "max_abs_cellwise_mean_diff_from_uniform" scalar per start,
-        summarizing divergence from the uniform reference.
-    """
     generator = torch.Generator()
     generator.manual_seed(seed)
 
@@ -346,7 +281,9 @@ def calibrate_mixing(
 
     for name, x0 in start_tables.items():
         terminal_tables = []
-        for _ in range(num_samples_per_start):
+        for _ in tqdm(
+            range(num_samples_per_start), desc=f"calibrate_mixing[{name}]"
+        ):
             result = simulate_trajectory(
                 x0, terminal_time, ctmc_rate, generator=generator
             )

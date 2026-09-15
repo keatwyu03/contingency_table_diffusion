@@ -19,7 +19,7 @@ from config import Config
 from ctmc import calibrate_mixing, format_calibration_report
 from h_dataset import HDataset, generate_h_dataset
 from h_model import HModel
-from sample_guided import simulate_guided_batch, summarize_guided_samples
+from sample_guided import check_h_constant_at_T, simulate_guided_batch, summarize_guided_samples
 from table_space import make_start_table_even, make_start_table_first_cell
 from train_h import load_h_model, set_seed, train_h_model
 
@@ -51,7 +51,7 @@ def cmd_calibrate(cfg: Config) -> None:
     )
     text = format_calibration_report(report)
     print(text)
-    out_path = os.path.join(cfg.output_dir, "calibration_report.txt")
+    out_path = os.path.join(cfg.results_dir, "calibration_report.txt")
     with open(out_path, "w") as f:
         f.write(text)
     print(f"\nSaved calibration report to {out_path}")
@@ -60,13 +60,16 @@ def cmd_calibrate(cfg: Config) -> None:
 def cmd_make_dataset(cfg: Config) -> None:
     """Generate and save the offline h-training dataset.
 
-    Each trajectory starts from an independent X_0 ~ Uniform(E_N) (see
-    generate_h_dataset), not from a single fixed deterministic table.
+    Each independent original sample draws X_0 ~ Uniform(E_N), computes
+    R(X_0) once, then forward-noises to several tau ~ Uniform(0, T) to
+    obtain (X_tau, tau) pairs all sharing that same R(X_0) target -- see
+    generate_h_dataset for the full forward-noising / reverse-guidance
+    convention.
     """
     set_seed(cfg.seed)
     dataset = generate_h_dataset(cfg)
     dataset.save(cfg.dataset_path)
-    print(f"Generated {len(dataset)} samples from {cfg.num_trajectories} trajectories.")
+    print(f"Generated {len(dataset)} samples from {cfg.num_trajectories} original tables.")
     print(f"Saved dataset to {cfg.dataset_path}")
 
 
@@ -85,34 +88,44 @@ def cmd_train_h(cfg: Config) -> None:
 
 
 def cmd_sample_guided(cfg: Config) -> None:
-    """Run the guided CTMC sampler using the trained h checkpoint.
+    """Run the guided CTMC sampler backward (t=T -> t=0) using the trained checkpoint.
 
-    Each guided sample starts from an independent X_0 ~ Uniform(E_N) (see
-    simulate_guided_batch), not from a single fixed deterministic table.
+    Each guided sample starts from an independent X_T drawn from
+    p_T^R(x) \\propto h_theta(T,x) (via rejection sampling by default; see
+    sample_guided.sample_x_start_reverse) and is simulated backward to
+    produce a generated (approximate) X_0.
     """
     set_seed(cfg.seed)
     model = load_h_model(cfg)
     model.eval()
+
+    generator = torch.Generator().manual_seed(cfg.seed)
+    mean_h_T, std_h_T = check_h_constant_at_T(model, cfg, num_probe_samples=200, generator=generator)
+    print(f"[diagnostic] h_theta(T, x) over 200 uniform tables: mean={mean_h_T:.6f} std={std_h_T:.6f}")
+
     results = simulate_guided_batch(
         model, cfg, num_samples=cfg.num_guided_samples
     )
     text = summarize_guided_samples(results, cfg)
     print(text)
-    out_path = os.path.join(cfg.output_dir, "guided_sampling_report.txt")
+    out_path = os.path.join(cfg.results_dir, "guided_sampling_report.txt")
     with open(out_path, "w") as f:
         f.write(text)
     print(f"\nSaved guided sampling report to {out_path}")
 
 
 def cmd_pipeline(cfg: Config) -> None:
-    """Run calibration, dataset generation, training, and guided sampling in order."""
-    print("\n=== Step 1/4: calibrate ===")
-    cmd_calibrate(cfg)
-    print("\n=== Step 2/4: make-dataset ===")
+    """Run dataset generation, training, and guided sampling in order.
+
+    Calibration is skipped here (run `python main.py calibrate` directly if
+    needed) -- it's a standalone diagnostic on the base CTMC's mixing, not a
+    dependency of dataset generation, training, or guided sampling.
+    """
+    print("\n=== Step 1/3: make-dataset ===")
     cmd_make_dataset(cfg)
-    print("\n=== Step 3/4: train-h ===")
+    print("\n=== Step 2/3: train-h ===")
     cmd_train_h(cfg)
-    print("\n=== Step 4/4: sample-guided ===")
+    print("\n=== Step 3/3: sample-guided ===")
     cmd_sample_guided(cfg)
 
 
@@ -122,6 +135,8 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
+        nargs="?",
+        default="pipeline",
         choices=["calibrate", "make-dataset", "train-h", "sample-guided", "pipeline"],
     )
     args = parser.parse_args()

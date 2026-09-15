@@ -1,18 +1,3 @@
-"""Training loop for h_theta(t, X_t) against the soft terminal reward.
-
-Loss (per spec):
-    L_h(theta) = E[ (h_theta(t, X_t) - exp(-gamma * S_2(X_T)))^2 ]
-
-i.e. plain MSE regression against the continuous target in (0, 1]. BCE is
-not used because the target is not a 0/1 label.
-
-An optional boundary loss term (disabled by default via
-cfg.boundary_loss_weight = 0.0) adds MSE at exactly t = T, where the
-"prediction" target is exactly the terminal reward by construction; this
-term is a redundant regularizer on the (t=T) samples already in the dataset
-and can help the network match the boundary condition h_theta(T, x) = R(x).
-"""
-
 from __future__ import annotations
 
 import os
@@ -20,10 +5,14 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from config import Config
 from h_dataset import HDataset
@@ -52,14 +41,23 @@ class TrainHistory:
 def split_dataset(
     dataset: HDataset, val_fraction: float, seed: int
 ) -> Tuple[HDataset, HDataset]:
-    """Split a dataset into train/val subsets using a fixed-seed generator."""
-    n_val = max(1, int(len(dataset) * val_fraction))
-    n_train = len(dataset) - n_val
+    """Split a dataset into train/val subsets by original_sample_id.
+
+    All (tau, X_tau) observations sharing the same original_sample_id (i.e.
+    drawn by forward-noising the same X_0) are kept together in either train
+    or val -- splitting at the flat sample level would leak the same X_0's
+    R(X_0) target across the split via correlated snapshots.
+    """
+    original_ids = sorted({s.original_sample_id for s in dataset.samples})
+    n_val_ids = max(1, int(len(original_ids) * val_fraction))
     generator = torch.Generator().manual_seed(seed)
-    train_subset, val_subset = random_split(
-        dataset, [n_train, n_val], generator=generator
-    )
-    return train_subset, val_subset
+    perm = torch.randperm(len(original_ids), generator=generator).tolist()
+    val_id_set = {original_ids[i] for i in perm[:n_val_ids]}
+    train_id_set = {original_ids[i] for i in perm[n_val_ids:]}
+
+    train_samples = [s for s in dataset.samples if s.original_sample_id in train_id_set]
+    val_samples = [s for s in dataset.samples if s.original_sample_id in val_id_set]
+    return HDataset(train_samples), HDataset(val_samples)
 
 
 def compute_loss(
@@ -69,12 +67,18 @@ def compute_loss(
     rewards: torch.Tensor,
     boundary_loss_weight: float,
 ) -> torch.Tensor:
-    """Compute the MSE loss (plus optional boundary term) for one batch."""
+    """Compute the MSE loss (plus optional boundary term) for one batch.
+
+    The optional boundary term targets t=0, where h_theta(0, x) = R(x)
+    exactly by construction (X_0 = X_tau when tau=0) -- this is the
+    boundary identity under the forward-noising orientation, distinct from
+    the old scheme's t=T boundary.
+    """
     preds = model.forward(tables, times)
     loss = nn.functional.mse_loss(preds, rewards)
 
     if boundary_loss_weight > 0.0:
-        is_boundary = times >= (1.0 - 1e-6)
+        is_boundary = times <= 1e-6
         if is_boundary.any():
             boundary_preds = preds[is_boundary]
             boundary_targets = rewards[is_boundary]
@@ -114,11 +118,13 @@ def train_h_model(
 
     history = TrainHistory()
 
-    for epoch in range(cfg.num_epochs):
+    epoch_bar = tqdm(range(cfg.num_epochs), desc="train_h[epochs]")
+    for epoch in epoch_bar:
         model.train()
         train_loss_sum = 0.0
         train_count = 0
-        for tables, times, rewards in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"epoch {epoch + 1} train", leave=False)
+        for tables, times, rewards in batch_bar:
             tables = tables.to(device)
             times = times.to(device)
             rewards = rewards.to(device)
@@ -132,6 +138,7 @@ def train_h_model(
             batch_size = tables.shape[0]
             train_loss_sum += loss.item() * batch_size
             train_count += batch_size
+            batch_bar.set_postfix(loss=loss.item())
 
         train_loss = train_loss_sum / max(train_count, 1)
         history.train_losses.append(train_loss)
@@ -154,7 +161,8 @@ def train_h_model(
         val_loss = val_loss_sum / max(val_count, 1)
         history.val_losses.append(val_loss)
 
-        print(
+        epoch_bar.set_postfix(train_loss=train_loss, val_loss=val_loss)
+        tqdm.write(
             f"[train_h] epoch {epoch + 1}/{cfg.num_epochs} "
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
         )
@@ -182,7 +190,31 @@ def train_h_model(
         history_path,
     )
 
+    plot_path = plot_loss_curve(history, cfg.results_dir)
+    print(f"[train_h] Saved loss curve to {plot_path}")
+
     return model, history
+
+
+def plot_loss_curve(history: TrainHistory, results_dir: str) -> str:
+    """Plot train/val loss vs. epoch and save to <results_dir>/loss_curve.png."""
+    os.makedirs(results_dir, exist_ok=True)
+    epochs = range(1, len(history.train_losses) + 1)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(epochs, history.train_losses, label="train_loss")
+    ax.plot(epochs, history.val_losses, label="val_loss")
+    ax.axvline(history.best_epoch + 1, color="gray", linestyle="--", alpha=0.5, label="best epoch")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("MSE loss")
+    ax.set_title("h_theta training loss")
+    ax.legend()
+    fig.tight_layout()
+
+    plot_path = os.path.join(results_dir, "loss_curve.png")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    return plot_path
 
 
 def load_h_model(cfg: Config, checkpoint_path: Optional[str] = None) -> HModel:

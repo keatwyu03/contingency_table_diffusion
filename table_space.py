@@ -4,6 +4,7 @@ from typing import List, Tuple
 
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 
 def validate_table(x: Tensor, m: int, n: int, total_count: int) -> None:
@@ -43,7 +44,6 @@ def squared_margin_error(
 def soft_reward(s2: Tensor, gamma: float) -> Tensor:
     return torch.exp(-gamma * s2)
 
-
 def exact_margins_satisfied(
     x: Tensor, target_rows: Tensor, target_cols: Tensor
 ) -> Tensor:
@@ -68,7 +68,8 @@ def sample_uniform_tables(
     num_bars = d - 1
 
     tables = torch.empty((num_samples, d), dtype=torch.float32, device=device)
-    for i in range(num_samples):
+    iterator = tqdm(range(num_samples), desc="sample_uniform_tables", disable=num_samples < 50)
+    for i in iterator:
         perm = torch.randperm(num_slots, generator=generator, device=device)
         bar_positions = perm[:num_bars]
         bar_positions, _ = torch.sort(bar_positions)
