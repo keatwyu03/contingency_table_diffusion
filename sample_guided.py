@@ -52,23 +52,45 @@ class GuidedSampleResult:
     jump_times: List[float] = field(default_factory=list)
 
 
-def _log_h_batch(model: HModel, tables: Tensor, t: float, total_count: int, terminal_time: float) -> Tensor:
-    """Evaluate log h_theta(t, x) in one batch for a stack of tables.
+_LOG_H_EVAL_BATCH_SIZE = 512
+
+
+def _log_h_batch(
+    model: HModel,
+    tables: Tensor,
+    t: float,
+    total_count: int,
+    terminal_time: float,
+    eval_batch_size: int = _LOG_H_EVAL_BATCH_SIZE,
+) -> Tensor:
+    """Evaluate log h_theta(t, x) for a stack of tables, chunked internally.
 
     Args:
-        tables: (B, m, n) unnormalized tables.
+        tables: (B, m, n) unnormalized tables. B can be large (a table with
+            many nonzero cells can have thousands of valid neighbors), so
+            the forward pass is split into chunks of at most
+            ``eval_batch_size`` rows to bound peak GPU memory -- pushing
+            all of B through the transformer at once can exhaust GPU memory
+            (observed as CUDA OOM) for a large neighbor set.
         t: unnormalized current time (scalar, same for all rows).
 
     Returns:
-        (B,) tensor of log h_theta values.
+        (B,) tensor of log h_theta values, on CPU.
     """
     device = next(model.parameters()).device
-    tables_norm = (tables.to(device)) / total_count
-    time_norm = torch.full(
-        (tables.shape[0],), t / terminal_time, dtype=torch.float32, device=device
-    )
+    B = tables.shape[0]
+    time_scalar = t / terminal_time
+
+    chunks: List[Tensor] = []
     with torch.no_grad():
-        return model.forward_log_h(tables_norm, time_norm)
+        for start in range(0, B, eval_batch_size):
+            end = min(start + eval_batch_size, B)
+            chunk_tables = (tables[start:end].to(device)) / total_count
+            chunk_time = torch.full(
+                (end - start,), time_scalar, dtype=torch.float32, device=device
+            )
+            chunks.append(model.forward_log_h(chunk_tables, chunk_time).cpu())
+    return torch.cat(chunks, dim=0)
 
 
 def guided_step(
@@ -102,18 +124,16 @@ def guided_step(
     K = num_ordered_pairs(cfg.m, cfg.n)
     log_q_base = torch.log(torch.tensor(cfg.ctmc_rate / K, dtype=torch.float32))
 
-    # Neural network forward pass runs on the model's device (possibly cuda),
-    # but everything else in this function (the table state, RNG generator,
-    # and multinomial draw) operates on CPU -- so results are moved back to
-    # CPU immediately after the forward pass to keep devices consistent for
-    # sample_exponential/multinomial, which require generator and tensor
-    # devices to match.
+    # Neural network forward pass runs on the model's device (possibly cuda,
+    # internally chunked -- see _log_h_batch), but everything else in this
+    # function (the table state, RNG generator, and multinomial draw)
+    # operates on CPU, which is what _log_h_batch already returns.
     log_h_x = _log_h_batch(
         model, x.unsqueeze(0), t, cfg.total_count, cfg.terminal_time
-    )[0].cpu()
+    )[0]
     log_h_neighbors = _log_h_batch(
         model, neighbors, t, cfg.total_count, cfg.terminal_time
-    ).cpu()
+    )
 
     log_ratio = log_h_neighbors - log_h_x
     log_ratio = torch.clamp(log_ratio, -cfg.log_ratio_clip, cfg.log_ratio_clip)
@@ -188,18 +208,33 @@ def simulate_guided_trajectory(
 
 @dataclass
 class DoobHInitResult:
-    """Diagnostics from rejection-sampling X_T ~ p_T^R(x) at the noisy boundary."""
+    """Diagnostics from rejection-sampling X_T ~ p_T^R(x) at the noisy boundary.
+
+    num_passed counts every candidate whose U <= h(T,x) test passed, even if
+    it was then discarded because enough samples had already been retained
+    (this happens on the final proposal batch, which is over-sized relative
+    to what's still needed). num_retained counts only the candidates that
+    were actually kept and appear in x_start_samples. These differ exactly
+    when a batch produces more passing candidates than are still needed.
+    """
 
     x_start_samples: Tensor  # (num_samples, m, n), samples at t=T
     num_proposed: int
-    num_accepted: int
+    num_passed: int
+    num_retained: int
     mean_h_proposed: float
-    mean_h_accepted: float
+    mean_h_accepted: float  # mean h over RETAINED candidates only
     mode: str  # "rejection" or "uniform_fallback"
 
     @property
-    def acceptance_rate(self) -> float:
-        return self.num_accepted / self.num_proposed if self.num_proposed > 0 else 0.0
+    def candidate_pass_rate(self) -> float:
+        """Fraction of proposed candidates whose U <= h(T,x) test passed."""
+        return self.num_passed / self.num_proposed if self.num_proposed > 0 else 0.0
+
+    @property
+    def retained_efficiency(self) -> float:
+        """Fraction of proposed candidates that were actually retained."""
+        return self.num_retained / self.num_proposed if self.num_proposed > 0 else 0.0
 
 
 def check_h_constant_at_T(
@@ -282,7 +317,8 @@ def sample_x_start_reverse(
         return DoobHInitResult(
             x_start_samples=x_start_samples,
             num_proposed=num_samples,
-            num_accepted=num_samples,
+            num_passed=num_samples,
+            num_retained=num_samples,
             mean_h_proposed=h_vals.mean().item(),
             mean_h_accepted=h_vals.mean().item(),
             mode="uniform_fallback",
@@ -293,6 +329,8 @@ def sample_x_start_reverse(
 
     accepted: List[Tensor] = []
     num_proposed = 0
+    num_passed = 0
+    num_retained = 0
     sum_h_proposed = 0.0
     sum_h_accepted = 0.0
 
@@ -320,20 +358,31 @@ def sample_x_start_reverse(
 
         num_proposed += batch_n
         sum_h_proposed += h_vals.sum().item()
-        sum_h_accepted += h_vals[accept_mask].sum().item()
 
-        for idx in torch.nonzero(accept_mask, as_tuple=False).view(-1).tolist():
-            if len(accepted) >= num_samples:
-                break
+        # passed_idx: every candidate whose U <= h(T,x) test passed. Only
+        # the first n_needed of these are actually retained -- the rest are
+        # discarded (this happens on the final, over-sized batch, where more
+        # candidates can pass than are still needed). Diagnostics below are
+        # computed from selected_idx (retained only), not passed_idx, so
+        # they reflect what was actually kept in x_start_samples.
+        passed_idx = torch.nonzero(accept_mask, as_tuple=False).view(-1)
+        selected_idx = passed_idx[:n_needed]
+
+        num_passed += len(passed_idx)
+        num_retained += len(selected_idx)
+        sum_h_accepted += h_vals[selected_idx].sum().item()
+
+        for idx in selected_idx.tolist():
             accepted.append(candidates[idx])
 
     x_start_samples = torch.stack(accepted[:num_samples], dim=0)
     return DoobHInitResult(
         x_start_samples=x_start_samples,
         num_proposed=num_proposed,
-        num_accepted=num_samples,
+        num_passed=num_passed,
+        num_retained=num_retained,
         mean_h_proposed=sum_h_proposed / num_proposed,
-        mean_h_accepted=sum_h_accepted / num_samples if num_samples > 0 else float("nan"),
+        mean_h_accepted=sum_h_accepted / num_retained if num_retained > 0 else float("nan"),
         mode="rejection",
     )
 
@@ -361,8 +410,10 @@ def simulate_guided_batch(
     print(
         f"[sample_x_start_reverse mode={init_result.mode}] "
         f"proposed={init_result.num_proposed} "
-        f"accepted={init_result.num_accepted} "
-        f"acceptance_rate={init_result.acceptance_rate:.4f} "
+        f"passed={init_result.num_passed} "
+        f"retained={init_result.num_retained} "
+        f"candidate_pass_rate={init_result.candidate_pass_rate:.4f} "
+        f"retained_efficiency={init_result.retained_efficiency:.4f} "
         f"mean_h_proposed={init_result.mean_h_proposed:.6f} "
         f"mean_h_accepted={init_result.mean_h_accepted:.6f}"
     )

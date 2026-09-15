@@ -1,45 +1,154 @@
+"""Cell-token Transformer for h_theta(t, X_t).
+
+Inputs are exactly (X_t, t) -- the current (unnormalized-count-recoverable)
+table and the current time. No target row/column margins, no margin
+errors, and no S_2(X_t) are ever given to this network; those quantities
+live exclusively in the reward R(X_0) = exp(-gamma * S_2(X_0)) used to
+build the training targets (see h_dataset.py).
+
+Architecture: 144 cell tokens (learned integer-count embedding + learned
+row/column position embeddings + a shared Fourier time embedding, each of
+dimension 128), 4 pre-LN transformer encoder layers (4 heads, feedforward
+dim 512, GELU, dropout 0.05), mean-pooled over all 144 tokens (no CLS
+token), then a 128->128->1 MLP head with SiLU. Output is
+sigmoid(logit) in (0, 1); log h is computed stably via logsigmoid(logit).
+
+A count embedding (not a scalar Linear(1, d_model) projection) is used for
+cell values: a scalar linear projection of a single normalized count is
+easily dominated by the larger-magnitude row/col position embeddings once
+summed, causing the model to lose sensitivity to count differences between
+tables. An integer-count embedding gives each count 0..total_count its own
+independently-learned, non-collinear vector.
+"""
+
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+D_MODEL = 128
+NUM_LAYERS = 4
+NUM_HEADS = 4
+FF_DIM = 512
+DROPOUT = 0.05
+NUM_FOURIER_FREQS = 32
+
+
+class FourierTimeEmbedding(nn.Module):
+    """Fourier features of t in [0,1] with log-spaced frequencies in [1, 1000],
+    followed by a small 64 -> 128 -> 128 MLP with SiLU."""
+
+    def __init__(self, d_model: int = D_MODEL, num_freqs: int = NUM_FOURIER_FREQS):
+        super().__init__()
+        freqs = torch.logspace(
+            math.log10(1.0), math.log10(1000.0), steps=num_freqs, dtype=torch.float32
+        )
+        self.register_buffer("freqs", freqs)
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * num_freqs, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, t: Tensor) -> Tensor:
+        # t: (B,) normalized time in [0,1]
+        args = 2.0 * math.pi * t.unsqueeze(-1) * self.freqs.unsqueeze(0)  # (B, num_freqs)
+        phi = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (B, 2*num_freqs)
+        return self.mlp(phi)  # (B, d_model)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-LN transformer encoder block."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.ln1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + self.dropout(attn_out)
+        h = self.ln2(x)
+        x = x + self.dropout(self.ff(h))
+        return x
+
 
 class HModel(nn.Module):
-    """MLP mapping (X_t/N, t/T) -> logit, with h = sigmoid(logit)."""
+    """Cell-token Transformer mapping (X_t, t) -> logit, with h = sigmoid(logit)."""
 
-    def __init__(self, m: int, n: int, hidden_width: int = 126, num_hidden_layers: int = 4):
+    def __init__(self, m: int, n: int, total_count: int):
         super().__init__()
         self.m = m
         self.n = n
-        self.input_dim = m * n + 1
+        self.total_count = total_count
 
-        layers = []
-        in_dim = self.input_dim
-        for _ in range(num_hidden_layers):
-            layers.append(nn.Linear(in_dim, hidden_width))
-            layers.append(nn.SiLU())
-            in_dim = hidden_width
-        self.hidden = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(in_dim, 1)
+        self.count_embedding = nn.Embedding(total_count + 1, D_MODEL)
+        self.row_embedding = nn.Embedding(m, D_MODEL)
+        self.column_embedding = nn.Embedding(n, D_MODEL)
+        self.time_embedding = FourierTimeEmbedding(D_MODEL)
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(D_MODEL, NUM_HEADS, FF_DIM, DROPOUT)
+                for _ in range(NUM_LAYERS)
+            ]
+        )
+        self.final_ln = nn.LayerNorm(D_MODEL)
+
+        self.head = nn.Sequential(
+            nn.Linear(D_MODEL, D_MODEL),
+            nn.SiLU(),
+            nn.Linear(D_MODEL, 1),
+        )
+
+        row_idx = torch.arange(m).unsqueeze(1).expand(m, n).reshape(-1)  # (m*n,)
+        col_idx = torch.arange(n).unsqueeze(0).expand(m, n).reshape(-1)  # (m*n,)
+        self.register_buffer("row_idx", row_idx)
+        self.register_buffer("col_idx", col_idx)
 
     def forward_logits(self, table_norm: Tensor, time_norm: Tensor) -> Tensor:
         """Compute the raw scalar logit for a batch of (normalized) inputs.
 
         Args:
-            table_norm: (B, m, n) tensor, already divided by N.
-            time_norm: (B,) tensor, already divided by T.
+            table_norm: (B, m, n), already divided by total_count.
+            time_norm: (B,), already divided by terminal_time.
 
         Returns:
             (B,) tensor of logits.
         """
-        batch_size = table_norm.shape[0]
-        flat_table = table_norm.reshape(batch_size, self.m * self.n)
-        time_col = time_norm.reshape(batch_size, 1).to(flat_table.dtype)
-        x = torch.cat([flat_table, time_col], dim=1)
-        h = self.hidden(x)
-        logits = self.output_layer(h).squeeze(-1)
+        B = table_norm.shape[0]
+        device = table_norm.device
+
+        counts = torch.round(table_norm * self.total_count).long()
+        counts = counts.clamp(0, self.total_count)
+        cell_tokens = self.count_embedding(counts.reshape(B, self.m * self.n))  # (B, d, D_MODEL)
+        cell_tokens = (
+            cell_tokens
+            + self.row_embedding(self.row_idx.to(device)).unsqueeze(0)
+            + self.column_embedding(self.col_idx.to(device)).unsqueeze(0)
+        )
+
+        time_embed = self.time_embedding(time_norm).unsqueeze(1)  # (B, 1, D_MODEL)
+        tokens = cell_tokens + time_embed  # broadcast over the 144 cell tokens
+
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.final_ln(tokens)
+
+        pooled = tokens.mean(dim=1)  # (B, D_MODEL) -- mean pool over all 144 cell tokens
+        logits = self.head(pooled).squeeze(-1)  # (B,)
         return logits
 
     def forward(self, table_norm: Tensor, time_norm: Tensor) -> Tensor:

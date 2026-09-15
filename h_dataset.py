@@ -121,7 +121,6 @@ class HDataset(Dataset):
 def generate_h_dataset(
     cfg: Config,
     num_original_samples: Optional[int] = None,
-    num_time_samples_per_original: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> HDataset:
     """Generate an offline dataset of (tau, X_tau, R(X_0)) triples.
@@ -129,42 +128,37 @@ def generate_h_dataset(
     For each independent original sample:
       1. Draw X_0 ~ Uniform(E_N) via exact stars-and-bars.
       2. Compute S_2(X_0) and R(X_0) = exp(-gamma * S_2(X_0)) immediately --
-         this is the training target for every (tau, X_tau) drawn below, and
-         does NOT depend on any future continuation of the chain.
-      3. For num_time_samples_per_original draws of tau ~ Uniform(0, T)
-         (including explicit tau=0 and tau=T observations, see below), run
-         the unconditional forward CTMC from X_0 to time tau to obtain
-         X_tau, and store (X_tau, tau, R(X_0)).
+         this is the training target for the (tau, X_tau) pair drawn below,
+         and does NOT depend on any future continuation of the chain.
+      3. Draw exactly one tau ~ Uniform(0, T), run the unconditional
+         forward CTMC from X_0 to time tau to obtain X_tau, and store
+         (X_tau, tau, R(X_0)).
 
     We deliberately do NOT simulate from X_tau onward to T to derive a
     label -- that was the previous ("terminal reward of a forward
     continuation") scheme and is removed here. Each tau requires its own
-    short forward simulation from X_0 to tau (independent noise draws), so
-    unlike the previous scheme this does not reuse a single stored path
-    across multiple tau values from the same X_0.
+    short forward simulation from X_0 to tau (independent noise draws).
 
-    Explicit boundary observations:
-      - tau=0 observations (X_0, 0, R(X_0)) teach the boundary identity
-        h_theta(0, x) = R(x) exactly.
-      - tau=T observations are included as diagnostics for whether
-        h_theta(T, x) has become approximately constant (full mixing).
+    Exactly ONE tau ~ Uniform(0, T) is drawn per X_0 (not several taus per
+    X_0 including forced tau=0 and tau=T boundary values): forcing boundary
+    observations into every group of K samples per X_0 would make a fixed
+    fraction (e.g. 2/K) of the dataset sit exactly at the two boundaries
+    instead of genuinely tau ~ Uniform(0, T), overweighting the boundaries
+    relative to the interior. If boundary supervision is wanted, it should
+    be added as separate, explicitly controlled-weight observations, not by
+    forcing two of every four (tau, X_tau) pairs from each X_0 onto the
+    boundary.
 
     Args:
         cfg: resolved Config.
-        num_original_samples: overrides cfg.num_trajectories if given (kept
-            as num_trajectories in Config for backward-compatible naming;
-            it counts independent X_0 draws here, not full trajectories).
-        num_time_samples_per_original: overrides cfg.num_time_samples_per_trajectory.
+        num_original_samples: overrides cfg.num_original_samples if given.
         seed: overrides cfg.seed if given.
 
     Returns:
-        An HDataset with num_original_samples * num_time_samples_per_original
-        rows, grouped by original_sample_id for split-safe train/val division.
+        An HDataset with num_original_samples rows (one tau per X_0), each
+        tagged with a distinct original_sample_id.
     """
-    num_original_samples = num_original_samples or cfg.num_trajectories
-    num_time_samples = (
-        num_time_samples_per_original or cfg.num_time_samples_per_trajectory
-    )
+    num_original_samples = num_original_samples or cfg.num_original_samples
     seed = cfg.seed if seed is None else seed
 
     generator = torch.Generator()
@@ -186,34 +180,22 @@ def generate_h_dataset(
         r_x0 = float(soft_reward(s2_x0, cfg.reward_gamma).item())
         x0_normalized = x0 / cfg.total_count
 
-        # tau values: explicit 0 and T, plus uniform interior draws for the rest.
-        num_interior = max(num_time_samples - 2, 0)
-        interior_taus = torch.rand(num_interior, generator=generator) * cfg.terminal_time
-        taus = torch.cat(
-            [
-                torch.tensor([0.0]),
-                interior_taus,
-                torch.tensor([cfg.terminal_time]),
-            ]
-        )[:num_time_samples]
+        tau = float(torch.rand((), generator=generator).item()) * cfg.terminal_time
 
-        for tau in taus.tolist():
-            if tau <= 0.0:
-                x_tau = x0
-            else:
-                result = simulate_trajectory(
-                    x0, tau, cfg.ctmc_rate, generator=generator
-                )
-                x_tau = result.terminal_table
+        if tau <= 0.0:
+            x_tau = x0
+        else:
+            result = simulate_trajectory(x0, tau, cfg.ctmc_rate, generator=generator)
+            x_tau = result.terminal_table
 
-            samples.append(
-                HDatasetSample(
-                    current_table=x_tau / cfg.total_count,
-                    time=tau / cfg.terminal_time,
-                    original_reward=r_x0,
-                    original_table=x0_normalized,
-                    original_sample_id=original_sample_id,
-                )
+        samples.append(
+            HDatasetSample(
+                current_table=x_tau / cfg.total_count,
+                time=tau / cfg.terminal_time,
+                original_reward=r_x0,
+                original_table=x0_normalized,
+                original_sample_id=original_sample_id,
             )
+        )
 
     return HDataset(samples)

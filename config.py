@@ -20,12 +20,7 @@ class Config:
     ctmc_rate: float = 100.0
 
     # --- Reward parameters --------------------------------------------------
-    reward_gamma: float = 0.0035
-
-    # --- Network architecture --------------------------------------------
-    hidden_width: int = 126
-    num_hidden_layers: int = 4
-    activation: str = "silu"
+    reward_gamma: float = 0.02
 
     # --- Target margins ----------------------------------------------------
     target_rows: List[int] = field(
@@ -41,8 +36,7 @@ class Config:
 
     # --- Dataset generation --------------------------------------------------
     batch_size: int = 64
-    num_trajectories: int = 2000
-    num_time_samples_per_trajectory: int = 4
+    num_original_samples: int = 200000
 
     # --- Training ------------------------------------------------------------
     num_epochs: int = 50
@@ -92,10 +86,6 @@ class Config:
             raise ValueError(f"reward_gamma must be positive, got {self.reward_gamma}")
         if self.terminal_time <= 0:
             raise ValueError(f"terminal_time must be positive, got {self.terminal_time}")
-        if self.activation.lower() != "silu":
-            raise ValueError(
-                f"Only 'silu' activation is supported per spec, got {self.activation}"
-            )
 
     def ensure_dirs(self) -> None:
         """Create checkpoint/output/results directories if they do not exist."""

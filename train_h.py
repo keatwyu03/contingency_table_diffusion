@@ -105,7 +105,7 @@ def train_h_model(
     cfg.ensure_dirs()
 
     device = torch.device(cfg.device)
-    model = model or HModel(cfg.m, cfg.n, cfg.hidden_width, cfg.num_hidden_layers)
+    model = model or HModel(cfg.m, cfg.n, cfg.total_count)
     model = model.to(device)
 
     train_subset, val_subset = split_dataset(dataset, cfg.val_fraction, cfg.seed)
@@ -222,7 +222,7 @@ def load_h_model(cfg: Config, checkpoint_path: Optional[str] = None) -> HModel:
     checkpoint_path = checkpoint_path or os.path.join(
         cfg.checkpoint_dir, "h_model_best.pt"
     )
-    model = HModel(cfg.m, cfg.n, cfg.hidden_width, cfg.num_hidden_layers)
+    model = HModel(cfg.m, cfg.n, cfg.total_count)
     blob = torch.load(checkpoint_path, map_location=cfg.device)
     model.load_state_dict(blob["model_state_dict"])
     model = model.to(torch.device(cfg.device))

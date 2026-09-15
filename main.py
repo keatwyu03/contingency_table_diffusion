@@ -61,15 +61,15 @@ def cmd_make_dataset(cfg: Config) -> None:
     """Generate and save the offline h-training dataset.
 
     Each independent original sample draws X_0 ~ Uniform(E_N), computes
-    R(X_0) once, then forward-noises to several tau ~ Uniform(0, T) to
-    obtain (X_tau, tau) pairs all sharing that same R(X_0) target -- see
+    R(X_0) once, then forward-noises to exactly one tau ~ Uniform(0, T) to
+    obtain a single (X_tau, tau) pair with that R(X_0) target -- see
     generate_h_dataset for the full forward-noising / reverse-guidance
     convention.
     """
     set_seed(cfg.seed)
     dataset = generate_h_dataset(cfg)
     dataset.save(cfg.dataset_path)
-    print(f"Generated {len(dataset)} samples from {cfg.num_trajectories} original tables.")
+    print(f"Generated {len(dataset)} samples from {cfg.num_original_samples} original tables.")
     print(f"Saved dataset to {cfg.dataset_path}")
 
 
