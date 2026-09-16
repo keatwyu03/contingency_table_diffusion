@@ -820,7 +820,7 @@ def sample_x_start_reverse(
     num_samples: int,
     generator: torch.Generator,
     mode: str = "rejection",
-    proposal_batch_size: int = 256,
+    proposal_batch_size: int = 2048,
 ) -> DoobHInitResult:
     """Sample the reverse sampler's starting distribution at t=T.
 

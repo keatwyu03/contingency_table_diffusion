@@ -150,7 +150,7 @@ def cmd_sample_guided(cfg: Config) -> None:
         batch_n = min(cfg.guided_batch_size, remaining)
         batch_results = simulate_guided_batch(
             model, cfg, num_samples=batch_n, seed=cfg.seed + batch_idx,
-            pbar=pbar, verbose=False,
+            pbar=pbar, verbose=False, init_mode="uniform_fallback",
         )
         results.extend(batch_results)
         remaining -= batch_n

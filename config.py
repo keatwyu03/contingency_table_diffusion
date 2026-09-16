@@ -14,7 +14,7 @@ class Config:
 
     # --- CTMC parameters --------------------------------------------------
     terminal_time: float = 1.0
-    ctmc_rate: float = 1000.0
+    ctmc_rate: float = 100.0
 
     # --- Reward parameters --------------------------------------------------
     reward_gamma: float = 0.01
