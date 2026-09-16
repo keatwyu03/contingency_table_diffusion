@@ -50,7 +50,20 @@ class Config:
     # Reuses the same num_original_samples CTMC trajectories generated for
     # the h-training dataset (see h_dataset.py) -- no separate trajectory
     # set is simulated for pretraining.
-    use_pretraining: bool = True
+    use_pretraining: bool = False
+
+    # --- Backward-Kolmogorov (BK) regularization for h-training --------------
+    # Adds two auxiliary terms to the direct Monte Carlo h-regression loss:
+    # a terminal-boundary term (u_theta(0, X_0) == log R(X_0)) and a dynamics
+    # term enforcing the backward-Kolmogorov PDE that log h_theta must solve
+    # under the unconditional CTMC generator (see train_h.compute_loss and
+    # train_h.bk_residual for the derivation and exact sign convention).
+    use_bk_regularization: bool = True
+    bk_loss_weight: float = 0.01
+    terminal_loss_weight: float = 0.1
+    bk_num_neighbors: int = 32
+    bk_log_ratio_clip: float = 10.0
+    h_log_epsilon: float = 1e-8
     pretrain_epochs: int = 50
     pretrain_learning_rate: float = 0.001
     pretrain_batch_size: int = 512

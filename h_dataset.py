@@ -78,8 +78,11 @@ class HDataset(Dataset):
 
     def __getitem__(self, idx: int):
         s = self.samples[idx]
-        return s.current_table, torch.tensor(s.time, dtype=torch.float32), torch.tensor(
-            s.original_reward, dtype=torch.float32
+        return (
+            s.current_table,
+            torch.tensor(s.time, dtype=torch.float32),
+            torch.tensor(s.original_reward, dtype=torch.float32),
+            s.original_table,
         )
 
     def save(self, path: str) -> None:
