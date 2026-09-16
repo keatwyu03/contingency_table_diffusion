@@ -50,6 +50,12 @@ class HDatasetSample:
     (used to verify the target and to split train/val by original sample so
     that no X_0's observations leak across the split) -- they are not model
     inputs. The model sees only (current_table, time).
+
+    later_table/later_time hold a second snapshot (X_s, s), s > tau, from
+    the SAME trajectory simulation used for (current_table, time) -- these
+    exist purely so pretrain_score.py can build (X_tau, tau, delta=s-tau)
+    -> X_s pretraining pairs without re-simulating the CTMC; they are not
+    used by h-training (train_h.py) at all.
     """
 
     current_table: Tensor  # X_tau, (m, n), normalized by N
@@ -57,6 +63,8 @@ class HDatasetSample:
     original_reward: float  # R(X_0) in (0, 1] -- the training target
     original_table: Tensor  # X_0, (m, n), normalized by N -- diagnostic only
     original_sample_id: int  # groups all (tau, X_tau) drawn from the same X_0
+    later_table: Tensor  # X_s, (m, n), normalized by N -- pretraining target only
+    later_time: float  # s, normalized by T, in [0, 1], s > tau -- pretraining only
 
 
 class HDataset(Dataset):
@@ -87,6 +95,10 @@ class HDataset(Dataset):
         sample_ids = torch.tensor(
             [s.original_sample_id for s in self.samples], dtype=torch.int64
         )
+        later_tables = torch.stack([s.later_table for s in self.samples], dim=0)
+        later_times = torch.tensor(
+            [s.later_time for s in self.samples], dtype=torch.float32
+        )
         torch.save(
             {
                 "tables": tables,
@@ -94,6 +106,8 @@ class HDataset(Dataset):
                 "rewards": rewards,
                 "original_tables": original_tables,
                 "sample_ids": sample_ids,
+                "later_tables": later_tables,
+                "later_times": later_times,
             },
             path,
         )
@@ -105,6 +119,8 @@ class HDataset(Dataset):
         tables, times, rewards = blob["tables"], blob["times"], blob["rewards"]
         original_tables = blob["original_tables"]
         sample_ids = blob["sample_ids"]
+        later_tables = blob["later_tables"]
+        later_times = blob["later_times"]
         samples = [
             HDatasetSample(
                 current_table=tables[i],
@@ -112,6 +128,8 @@ class HDataset(Dataset):
                 original_reward=float(rewards[i]),
                 original_table=original_tables[i],
                 original_sample_id=int(sample_ids[i]),
+                later_table=later_tables[i],
+                later_time=float(later_times[i]),
             )
             for i in range(tables.shape[0])
         ]
@@ -123,24 +141,29 @@ def generate_h_dataset(
     num_original_samples: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> HDataset:
-    """Generate an offline dataset of (tau, X_tau, R(X_0)) triples.
+    """Generate an offline dataset of (tau, X_tau, R(X_0), s, X_s) rows.
 
     For each independent original sample:
       1. Draw X_0 ~ Uniform(E_N) via exact stars-and-bars.
       2. Compute S_2(X_0) and R(X_0) = exp(-gamma * S_2(X_0)) immediately --
          this is the training target for the (tau, X_tau) pair drawn below,
          and does NOT depend on any future continuation of the chain.
-      3. Draw exactly one tau ~ Uniform(0, T), run the unconditional
-         forward CTMC from X_0 to time tau to obtain X_tau, and store
-         (X_tau, tau, R(X_0)).
+      3. Draw tau ~ Uniform(0, T) and a second, later time
+         s ~ Uniform(tau, T), then run the unconditional forward CTMC ONCE
+         from X_0 out to time s (not two separate simulations), recording
+         snapshots at both tau and s to obtain X_tau and X_s from that
+         single run. Store (X_tau, tau, R(X_0)) as before, plus (X_s, s) as
+         extra fields used only by CTMC pretraining (see pretrain_score.py)
+         to build (X_tau, tau, delta=s-tau) -> X_s pairs -- h-training
+         (train_h.py) does not read later_table/later_time at all.
 
-    We deliberately do NOT simulate from X_tau onward to T to derive a
-    label -- that was the previous ("terminal reward of a forward
-    continuation") scheme and is removed here. Each tau requires its own
-    short forward simulation from X_0 to tau (independent noise draws).
+    We deliberately do NOT simulate from X_tau onward to T to derive an
+    h-training label -- that was the previous ("terminal reward of a
+    forward continuation") scheme and is removed here. The X_s snapshot
+    added here is solely a pretraining target, not an h-training target.
 
-    Exactly ONE tau ~ Uniform(0, T) is drawn per X_0 (not several taus per
-    X_0 including forced tau=0 and tau=T boundary values): forcing boundary
+    Exactly ONE (tau, s) pair is drawn per X_0 (not several per X_0
+    including forced tau=0 and tau=T boundary values): forcing boundary
     observations into every group of K samples per X_0 would make a fixed
     fraction (e.g. 2/K) of the dataset sit exactly at the two boundaries
     instead of genuinely tau ~ Uniform(0, T), overweighting the boundaries
@@ -155,8 +178,8 @@ def generate_h_dataset(
         seed: overrides cfg.seed if given.
 
     Returns:
-        An HDataset with num_original_samples rows (one tau per X_0), each
-        tagged with a distinct original_sample_id.
+        An HDataset with num_original_samples rows (one (tau, s) pair per
+        X_0), each tagged with a distinct original_sample_id.
     """
     num_original_samples = num_original_samples or cfg.num_original_samples
     seed = cfg.seed if seed is None else seed
@@ -181,12 +204,24 @@ def generate_h_dataset(
         x0_normalized = x0 / cfg.total_count
 
         tau = float(torch.rand((), generator=generator).item()) * cfg.terminal_time
-
-        if tau <= 0.0:
-            x_tau = x0
+        # s ~ Uniform(tau, T); guard the (measure-zero) tau == T case.
+        if tau >= cfg.terminal_time:
+            s_time = cfg.terminal_time
         else:
-            result = simulate_trajectory(x0, tau, cfg.ctmc_rate, generator=generator)
-            x_tau = result.terminal_table
+            s_time = tau + float(torch.rand((), generator=generator).item()) * (
+                cfg.terminal_time - tau
+            )
+
+        if s_time <= 0.0:
+            x_tau = x0
+            x_s = x0
+        else:
+            result = simulate_trajectory(
+                x0, s_time, cfg.ctmc_rate,
+                snapshot_times=[tau, s_time], generator=generator,
+            )
+            x_tau = result.snapshots[0].table
+            x_s = result.snapshots[1].table
 
         samples.append(
             HDatasetSample(
@@ -195,6 +230,8 @@ def generate_h_dataset(
                 original_reward=r_x0,
                 original_table=x0_normalized,
                 original_sample_id=original_sample_id,
+                later_table=x_s / cfg.total_count,
+                later_time=s_time / cfg.terminal_time,
             )
         )
 

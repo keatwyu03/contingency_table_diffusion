@@ -29,7 +29,7 @@ class Config:
 
     # --- Dataset generation --------------------------------------------------
     batch_size: int = 512
-    num_original_samples: int = 350000
+    num_original_samples: int = 200000
 
     # --- Training ------------------------------------------------------------
     num_epochs: int = 50
@@ -38,11 +38,20 @@ class Config:
     grad_clip_norm: float = 1.0
     val_fraction: float = 0.1
     boundary_loss_weight: float = 0.0
+    # Early stopping: training halts once val_loss fails to improve by at
+    # least early_stop_min_delta for early_stop_patience consecutive epochs.
+    # The final returned/checkpointed model is always the best-val-loss one
+    # (not necessarily the last epoch run), whether or not early stopping
+    # actually triggers.
+    early_stop_patience: int = 5
+    early_stop_min_delta: float = 1e-5
 
     # --- CTMC pretraining (E_phi encoder) -------------------------------------
+    # Reuses the same num_original_samples CTMC trajectories generated for
+    # the h-training dataset (see h_dataset.py) -- no separate trajectory
+    # set is simulated for pretraining.
     use_pretraining: bool = True
-    pretrain_num_trajectories: int = 5000
-    pretrain_epochs: int = 10
+    pretrain_epochs: int = 50
     pretrain_learning_rate: float = 0.001
     pretrain_batch_size: int = 512
     # Scales pretrain_learning_rate for E_phi during the joint h-training
@@ -50,7 +59,7 @@ class Config:
     pretrain_encoder_lr_scale: float = 0.1
 
     # --- Guided sampling -----------------------------------------------------
-    num_guided_samples: int = 10000
+    num_guided_samples: int = 2000
     guided_batch_size: int = 512
     max_time_step: float = 0.005
 

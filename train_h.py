@@ -145,6 +145,8 @@ def train_h_model(
         )
 
     history = TrainHistory()
+    best_state_dict = None
+    epochs_without_improvement = 0
 
     epoch_bar = tqdm(range(cfg.num_epochs), desc="train_h[epochs]")
     for epoch in epoch_bar:
@@ -199,14 +201,34 @@ def train_h_model(
         last_ckpt_path = os.path.join(cfg.checkpoint_dir, "h_model_last.pt")
         torch.save({"model_state_dict": model.state_dict(), "epoch": epoch}, last_ckpt_path)
 
-        if val_loss < history.best_val_loss:
+        if val_loss < history.best_val_loss - cfg.early_stop_min_delta:
             history.best_val_loss = val_loss
             history.best_epoch = epoch
+            epochs_without_improvement = 0
+            best_state_dict = {
+                k: v.detach().clone() for k, v in model.state_dict().items()
+            }
             best_ckpt_path = os.path.join(cfg.checkpoint_dir, "h_model_best.pt")
             torch.save(
                 {"model_state_dict": model.state_dict(), "epoch": epoch, "val_loss": val_loss},
                 best_ckpt_path,
             )
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= cfg.early_stop_patience:
+                tqdm.write(
+                    f"[train_h] early stopping at epoch {epoch + 1}/{cfg.num_epochs}: "
+                    f"val_loss did not improve by >= {cfg.early_stop_min_delta} for "
+                    f"{cfg.early_stop_patience} consecutive epochs "
+                    f"(best_val_loss={history.best_val_loss:.6f} at epoch {history.best_epoch + 1})"
+                )
+                break
+
+    # Always leave `model` (and the returned model) at its best-val-loss
+    # weights, not the last epoch run's weights, whether or not early
+    # stopping triggered.
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
 
     history_path = os.path.join(cfg.checkpoint_dir, "train_history.pt")
     torch.save(

@@ -1,15 +1,17 @@
 """Optional CTMC-pretraining stage for the h-function encoder E_phi.
 
-This does NOT introduce a new noising process: trajectories are generated
-with the existing unconditional CTMC (ctmc.simulate_trajectory), the same
-sampler used everywhere else in this project. Pretraining only changes how
-the encoder used by h_theta is initialized before h-training (see
-train_h.py / main.py).
+This does NOT introduce a new noising process and does NOT simulate any
+separate set of CTMC trajectories: it reuses the exact same
+num_original_samples trajectories already simulated for the h-training
+dataset (see h_dataset.generate_h_dataset), which stores an extra later
+snapshot (X_s, s) per trajectory alongside the (X_tau, tau, R(X_0)) row
+used for h-training. Pretraining only changes how the encoder used by
+h_theta is initialized before h-training (see train_h.py / main.py).
 
-Task: for two times t < s sampled along a trajectory, predict X_s from
-(X_t, t, delta) where delta = s - t.
+Task: for the two times tau < s recorded per trajectory, predict X_s from
+(X_tau, tau, delta) where delta = s - tau.
 
-    (X_t, t, delta) -> E_phi -> G_psi -> predicted X_s
+    (X_tau, tau, delta) -> E_phi -> G_psi -> predicted X_s
 
 E_phi (PretrainEncoder) reuses HModel's own encoder stack (count/row/column
 embeddings + transformer blocks + pooling, via HModel.encode) so the
@@ -30,18 +32,18 @@ only E_phi's weights are kept.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from config import Config
-from ctmc import simulate_trajectory, table_at_time
+from h_dataset import HDataset
 from h_model import D_MODEL, FourierTimeEmbedding, HModel
-from table_space import sample_uniform_tables
 
 
 class PretrainEncoder(nn.Module):
@@ -117,81 +119,71 @@ class PretrainHistory:
     losses: List[float]
 
 
-def _sample_t_s_pairs(
-    terminal_time: float, batch_n: int, generator: Optional[torch.Generator] = None
-) -> Tuple[Tensor, Tensor]:
-    """Sample t < s independently ~ Uniform(0, terminal_time) per trajectory."""
-    a = torch.rand((batch_n,), generator=generator) * terminal_time
-    b = torch.rand((batch_n,), generator=generator) * terminal_time
-    t = torch.minimum(a, b)
-    s = torch.maximum(a, b)
-    # Avoid the (measure-zero) degenerate delta=0 case.
-    s = torch.where(s <= t, t + 1e-6, s).clamp(max=terminal_time)
-    return t, s
+class PretrainPairDataset(Dataset):
+    """Wraps an HDataset's (X_tau, tau, X_s, s) fields for the pretraining task.
 
-
-def generate_pretrain_batch(
-    cfg: Config, batch_n: int, generator: Optional[torch.Generator] = None
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Simulate ``batch_n`` independent CTMC trajectories and extract one
-    (X_t, t, delta, X_s) example from each, via the existing unconditional
-    CTMC sampler (ctmc.simulate_trajectory) -- no new noising process.
-
-    Returns:
-        x_t: (B, m, n) unnormalized tables at time t.
-        t: (B,) normalized in [0, 1].
-        delta: (B,) normalized in [0, 1], = (s - t) / terminal_time.
-        x_s: (B, m, n) unnormalized tables at time s -- the target.
+    Reads the later_table/later_time fields that h_dataset.generate_h_dataset
+    stores alongside each (X_tau, tau, R(X_0)) row -- from the SAME
+    trajectory simulation used for h-training -- rather than simulating any
+    new trajectories.
     """
-    x0_batch = sample_uniform_tables(
-        batch_n, cfg.m, cfg.n, cfg.total_count, generator=generator
-    )
-    t_batch, s_batch = _sample_t_s_pairs(cfg.terminal_time, batch_n, generator=generator)
 
-    x_t_list: List[Tensor] = []
-    x_s_list: List[Tensor] = []
-    for i in range(batch_n):
-        t_i = float(t_batch[i].item())
-        s_i = float(s_batch[i].item())
-        result = simulate_trajectory(
-            x0_batch[i], s_i, cfg.ctmc_rate, snapshot_times=[t_i, s_i], generator=generator
+    def __init__(self, dataset: HDataset):
+        self.samples = dataset.samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        delta = s.later_time - s.time
+        return (
+            s.current_table,
+            torch.tensor(s.time, dtype=torch.float32),
+            torch.tensor(delta, dtype=torch.float32),
+            s.later_table,
         )
-        x_t_list.append(result.snapshots[0].table.float())
-        x_s_list.append(result.snapshots[1].table.float())
-
-    x_t = torch.stack(x_t_list, dim=0)
-    x_s = torch.stack(x_s_list, dim=0)
-    delta = (s_batch - t_batch) / cfg.terminal_time
-    t_norm = t_batch / cfg.terminal_time
-    return x_t, t_norm, delta, x_s
 
 
 def compute_pretrain_loss(
     encoder: PretrainEncoder,
     head: ScorePredictionHead,
-    x_t: Tensor,
+    x_t_norm: Tensor,
     t_norm: Tensor,
     delta_norm: Tensor,
-    x_s: Tensor,
+    x_s_norm: Tensor,
     total_count: int,
 ) -> Tensor:
     """Per-cell cross-entropy between predicted and actual X_s cell counts.
 
     X_s is the LABEL (via its per-cell integer class); it is never fed into
-    the encoder, only used as the classification target.
+    the encoder, only used as the classification target. Inputs are already
+    normalized by total_count, matching HDataset's convention (see
+    h_dataset.py) -- x_s_norm is un-normalized back to integer counts here
+    only to build the classification target.
     """
-    B, m, n = x_s.shape
-    x_t_norm = x_t / total_count
+    B, m, n = x_s_norm.shape
     pooled = encoder(x_t_norm, t_norm, delta_norm)
     logits = head(pooled)  # (B, m*n, total_count+1)
 
-    target_classes = torch.round(x_s).long().clamp(0, total_count).reshape(B, m * n)
+    target_classes = torch.round(x_s_norm * total_count).long().clamp(0, total_count).reshape(B, m * n)
     loss = F.cross_entropy(logits.reshape(B * m * n, -1), target_classes.reshape(-1))
     return loss
 
 
-def pretrain_score(cfg: Config, verbose: bool = True) -> PretrainEncoder:
+def pretrain_score(cfg: Config, dataset: HDataset, verbose: bool = True) -> PretrainEncoder:
     """Pretrain E_phi (+ discardable G_psi) on the CTMC-trajectory scoring task.
+
+    Reuses the SAME trajectories already simulated for ``dataset`` (see
+    h_dataset.generate_h_dataset) -- no new CTMC trajectories are simulated
+    here. Each row's (X_tau, tau, X_s, s) fields yield one
+    (X_tau, tau, delta=s-tau) -> X_s pretraining example.
+
+    Args:
+        cfg: resolved Config.
+        dataset: the HDataset produced by generate_h_dataset (or loaded via
+            HDataset.load), whose later_table/later_time fields this
+            function reads.
 
     Returns:
         The trained PretrainEncoder holding E_phi's weights. G_psi
@@ -200,7 +192,6 @@ def pretrain_score(cfg: Config, verbose: bool = True) -> PretrainEncoder:
         HModel.load_encoder_state_dict(encoder.encoder_state_dict()).
     """
     device = torch.device(cfg.device)
-    generator = torch.Generator().manual_seed(cfg.seed)
 
     encoder = PretrainEncoder(cfg.m, cfg.n, cfg.total_count).to(device)
     head = ScorePredictionHead(cfg.m, cfg.n, cfg.total_count).to(device)
@@ -211,7 +202,8 @@ def pretrain_score(cfg: Config, verbose: bool = True) -> PretrainEncoder:
         weight_decay=cfg.weight_decay,
     )
 
-    num_batches_per_epoch = max(1, cfg.pretrain_num_trajectories // cfg.pretrain_batch_size)
+    pair_dataset = PretrainPairDataset(dataset)
+    loader = DataLoader(pair_dataset, batch_size=cfg.pretrain_batch_size, shuffle=True)
     history = PretrainHistory(losses=[])
 
     epoch_bar = tqdm(range(cfg.pretrain_epochs), desc="pretrain_score[epochs]", disable=not verbose)
@@ -219,21 +211,18 @@ def pretrain_score(cfg: Config, verbose: bool = True) -> PretrainEncoder:
         encoder.train()
         head.train()
         epoch_loss_sum = 0.0
-        for _ in tqdm(
-            range(num_batches_per_epoch), desc=f"epoch {epoch + 1} pretrain",
-            leave=False, disable=not verbose,
+        num_batches = 0
+        for x_t_norm, t_norm, delta_norm, x_s_norm in tqdm(
+            loader, desc=f"epoch {epoch + 1} pretrain", leave=False, disable=not verbose,
         ):
-            x_t, t_norm, delta_norm, x_s = generate_pretrain_batch(
-                cfg, cfg.pretrain_batch_size, generator=generator
-            )
-            x_t = x_t.to(device)
+            x_t_norm = x_t_norm.to(device)
             t_norm = t_norm.to(device)
             delta_norm = delta_norm.to(device)
-            x_s = x_s.to(device)
+            x_s_norm = x_s_norm.to(device)
 
             optimizer.zero_grad()
             loss = compute_pretrain_loss(
-                encoder, head, x_t, t_norm, delta_norm, x_s, cfg.total_count
+                encoder, head, x_t_norm, t_norm, delta_norm, x_s_norm, cfg.total_count
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -241,8 +230,9 @@ def pretrain_score(cfg: Config, verbose: bool = True) -> PretrainEncoder:
             )
             optimizer.step()
             epoch_loss_sum += float(loss.detach().item())
+            num_batches += 1
 
-        epoch_loss = epoch_loss_sum / num_batches_per_epoch
+        epoch_loss = epoch_loss_sum / max(num_batches, 1)
         history.losses.append(epoch_loss)
         if verbose:
             epoch_bar.set_postfix(loss=epoch_loss)

@@ -85,12 +85,14 @@ def cmd_train_h(cfg: Config) -> None:
     """Train h_theta on the saved dataset (generating it first if missing).
 
     If cfg.use_pretraining is True, E_phi is first pretrained on CTMC
-    trajectory scoring (see pretrain_score.py), transferred into a fresh
-    HModel, and then E_phi + H_omega are jointly fine-tuned on the soft
-    terminal reward regression objective (E_phi at a reduced learning rate
-    via cfg.pretrain_encoder_lr_scale). If False, behavior is unchanged from
-    before pretraining was added: a freshly-initialized HModel is trained
-    directly on the reward regression objective.
+    trajectory scoring (see pretrain_score.py) using the SAME trajectories
+    already in ``dataset`` (no separate trajectories are simulated for
+    pretraining), transferred into a fresh HModel, and then E_phi + H_omega
+    are jointly fine-tuned on the soft terminal reward regression objective
+    (E_phi at a reduced learning rate via cfg.pretrain_encoder_lr_scale). If
+    False, behavior is unchanged from before pretraining was added: a
+    freshly-initialized HModel is trained directly on the reward regression
+    objective.
     """
     set_seed(cfg.seed)
     if not os.path.exists(cfg.dataset_path):
@@ -100,7 +102,7 @@ def cmd_train_h(cfg: Config) -> None:
 
     if cfg.use_pretraining:
         print("[train-h] use_pretraining=True: running CTMC pretraining for E_phi.")
-        pretrained_encoder = pretrain_score(cfg)
+        pretrained_encoder = pretrain_score(cfg, dataset)
         h_model = HModel(cfg.m, cfg.n, cfg.total_count)
         h_model.load_encoder_state_dict(pretrained_encoder.encoder_state_dict())
         model, history = train_h_model(
