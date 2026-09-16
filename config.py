@@ -60,7 +60,16 @@ class Config:
     # train_h.bk_residual for the derivation and exact sign convention).
     use_bk_regularization: bool = True
     bk_loss_weight: float = 0.01
-    terminal_loss_weight: float = 0.1
+    terminal_loss_weight: float = 0.001
+    # Like BK, the terminal-boundary term is evaluated on a small random
+    # ANCHOR subset of each minibatch rather than every row: it is a
+    # regularizer computed via a SECOND full transformer forward pass (at
+    # t=0, over original_table instead of the current (X_tau, tau) batch),
+    # so running it over the full (often 512-row) batch every step doubles
+    # the per-step forward/backward memory and was observed to push a
+    # 12GB GPU into OOM. A small anchor subset gives the same boundary
+    # signal, averaged over steps, at a small fraction of the cost.
+    terminal_anchor_batch_size: int = 32
     # BK is evaluated on a small random ANCHOR subset of each minibatch (not
     # every row) -- the PDE residual is a pointwise constraint, so a handful
     # of anchors per step is enough signal without scaling cost with the
@@ -70,9 +79,20 @@ class Config:
     # all_neighbors -- a table can have thousands of valid neighbors, and
     # materializing all of them just to keep bk_num_neighbors is wasted
     # compute/memory (this previously caused a CUDA OOM at batch_size=512).
-    bk_anchor_batch_size: int = 16
+    bk_anchor_batch_size: int = 8
     bk_num_neighbors: int = 32
     bk_log_ratio_clip: float = 10.0
+    # BK's double derivative (autograd through time_norm with create_graph=
+    # True) can only run on the MATH scaled-dot-product-attention backend on
+    # GPUs that don't support a fused kernel with a second derivative (e.g.
+    # sm_70/TITAN V and observed on the V100s used here too) -- measured
+    # locally at ~2x the per-step cost of MC+terminal alone. bk_every_n_steps
+    # computes BK on only every Nth training/validation batch (by a
+    # monotonically increasing global_step counter) instead of every batch,
+    # scaling the BK loss by bk_every_n_steps on the batches where it IS
+    # computed so its contribution stays an unbiased estimate of
+    # bk_loss_weight * L_BK in expectation over steps.
+    bk_every_n_steps: int = 4
     h_log_epsilon: float = 1e-8
 
     # --- Guided-sampler initial distribution ----------------------------------
@@ -102,7 +122,7 @@ class Config:
     checkpoint_dir: str = 'checkpoints'
     output_dir: str = 'outputs'
     dataset_path: str = 'outputs/h_dataset.pt'
-    results_dir: str = 'results'
+    results_dir: str = 'results/pretrain_kolmogorov_hfunction_100'
 
     def __post_init__(self) -> None:
         if self.m <= 0 or self.n <= 0:
@@ -127,6 +147,37 @@ class Config:
             raise ValueError(f'guided_batch_size must be positive, got {self.guided_batch_size}')
 
     def ensure_dirs(self) -> None:
+        """Create checkpoint_dir/output_dir/results_dir, auto-avoiding a
+        collision with an IN-PROGRESS run in the same checkpoint_dir or
+        results_dir.
+
+        checkpoint_dir is written to every epoch (h_model_last.pt is
+        overwritten each epoch, before results_dir gets anything -- that
+        only gets a report/loss-curve at the very end), so it is checked
+        for existing content in addition to results_dir; either one having
+        files bumps BOTH dirs together with a "-run2", "-run3", ... suffix
+        (they stay paired) rather than silently letting two concurrent
+        processes overwrite each other's checkpoints. An empty (or
+        not-yet-created) pair of dirs is used as-is -- this only triggers
+        when there's actually something there to collide with.
+        """
+        def has_content(path: str) -> bool:
+            return os.path.isdir(path) and len(os.listdir(path)) > 0
+
+        original_results_dir = self.results_dir
+        original_checkpoint_dir = self.checkpoint_dir
+        suffix = 1
+        while has_content(self.results_dir) or has_content(self.checkpoint_dir):
+            suffix += 1
+            self.results_dir = f"{original_results_dir}-run{suffix}"
+            self.checkpoint_dir = f"{original_checkpoint_dir}-run{suffix}"
+        if suffix > 1:
+            print(
+                f"[Config.ensure_dirs] {original_results_dir} or {original_checkpoint_dir} "
+                f"already has files (another run in progress?) -- using "
+                f"{self.results_dir} and {self.checkpoint_dir} instead."
+            )
+
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)

@@ -129,6 +129,17 @@ class BKDiagnostics:
             self.sum_exit_intensity += bk_stats["sum_exit_intensity"]
             self.num_bk_rows += bk_stats["num_rows"]
 
+    def short_summary(self) -> str:
+        """Compact one-line summary: just the three weighted contributions,
+        the number actually worth watching for e.g. terminal-loss dominance
+        (see full summary() for the rest of the diagnostics)."""
+        nb = max(self.num_batches, 1)
+        return (
+            f"weighted mc={self.sum_mc_weighted / nb:.6f} "
+            f"terminal={self.sum_terminal_weighted / nb:.6f} "
+            f"bk={self.sum_bk_weighted / nb:.6f}"
+        )
+
     def summary(self) -> str:
         nb = max(self.num_batches, 1)
         nr = max(self.num_bk_rows, 1)
@@ -380,6 +391,7 @@ def compute_loss(
     original_tables: torch.Tensor,
     boundary_loss_weight: float,
     cfg: Config,
+    global_step: int = 0,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute the hybrid direct-h + backward-Kolmogorov loss for one batch.
 
@@ -397,14 +409,21 @@ def compute_loss(
 
     L_BK: mean squared normalized backward-Kolmogorov residual (see
     bk_residual) enforcing the PDE u_theta must solve under the
-    unconditional CTMC generator, evaluated at every (t, X_t) training row
-    (not only the boundary).
+    unconditional CTMC generator. SPARSE evaluation: bk_residual is only
+    called when global_step % cfg.bk_every_n_steps == 0 (its double-
+    backward forces the slow MATH attention kernel on GPUs without a fused
+    kernel that supports a second derivative -- see bk_residual's
+    docstring -- measured at ~2x the per-step cost of MC+terminal alone).
+    On steps where it IS computed, the loss is scaled by bk_every_n_steps
+    so E_step[contribution] = bk_loss_weight * L_BK is unchanged in
+    expectation; on skipped steps bk_residual is not called at all and the
+    BK contribution to this step's total_loss is exactly zero.
 
     Returns:
         (total_loss, unweighted_parts): unweighted_parts has keys
         "mc_loss", "terminal_loss", "bk_loss" (each a python float, detached)
-        plus, when use_bk_regularization is True, the bk_residual diagnostics
-        dict under "bk_stats".
+        plus, when use_bk_regularization is True AND this step evaluates BK,
+        the bk_residual diagnostics dict under "bk_stats".
     """
     device = tables.device
     preds = model.forward(tables, times)
@@ -422,11 +441,15 @@ def compute_loss(
     terminal_loss_value = 0.0
 
     if cfg.terminal_loss_weight > 0.0:
-        original_table_norm = original_tables.to(device)  # already normalized by N (see HDatasetSample)
-        zero_time = torch.zeros(tables.shape[0], device=device)
+        B = tables.shape[0]
+        anchor_n = min(B, cfg.terminal_anchor_batch_size)
+        anchor_idx = torch.randperm(B, device=device)[:anchor_n]
+
+        original_table_norm = original_tables[anchor_idx]  # already normalized by N (see HDatasetSample)
+        zero_time = torch.zeros(anchor_n, device=device)
         terminal_logit = model.forward_logits(original_table_norm, zero_time)
         u_terminal = nn.functional.logsigmoid(terminal_logit)
-        log_r_terminal = torch.log(rewards.clamp(min=cfg.h_log_epsilon))
+        log_r_terminal = torch.log(rewards[anchor_idx].clamp(min=cfg.h_log_epsilon))
         terminal_loss = nn.functional.mse_loss(u_terminal, log_r_terminal)
         total_loss = total_loss + cfg.terminal_loss_weight * terminal_loss
         terminal_loss_value = terminal_loss.detach().item()
@@ -440,13 +463,14 @@ def compute_loss(
         "bk_weighted": 0.0,
     }
 
-    if cfg.use_bk_regularization:
+    if cfg.use_bk_regularization and global_step % cfg.bk_every_n_steps == 0:
         residual, bk_stats = bk_residual(model, tables, times, cfg)
         if residual.numel() > 0:
             bk_loss = (residual ** 2).mean()
-            total_loss = total_loss + cfg.bk_loss_weight * bk_loss
-            unweighted_parts["bk_loss"] = bk_loss.detach().item()
-            unweighted_parts["bk_weighted"] = cfg.bk_loss_weight * bk_loss.detach().item()
+            scaled_bk_loss = cfg.bk_every_n_steps * bk_loss
+            total_loss = total_loss + cfg.bk_loss_weight * scaled_bk_loss
+            unweighted_parts["bk_loss"] = scaled_bk_loss.detach().item()
+            unweighted_parts["bk_weighted"] = cfg.bk_loss_weight * scaled_bk_loss.detach().item()
             unweighted_parts["bk_stats"] = bk_stats
 
     unweighted_parts["total_loss"] = total_loss.detach().item()
@@ -513,6 +537,7 @@ def train_h_model(
     history = TrainHistory()
     best_state_dict = None
     epochs_without_improvement = 0
+    global_step = 0  # monotonically increasing across the whole run (all epochs), gates sparse BK evaluation
 
     epoch_bar = tqdm(range(cfg.num_epochs), desc="train_h[epochs]")
     for epoch in epoch_bar:
@@ -520,8 +545,7 @@ def train_h_model(
         train_loss_sum = torch.zeros((), device=device)
         train_count = 0
         train_diag = BKDiagnostics()
-        batch_bar = tqdm(train_loader, desc=f"epoch {epoch + 1} train", leave=False)
-        for tables, times, rewards, original_tables in batch_bar:
+        for tables, times, rewards, original_tables in train_loader:
             tables = tables.to(device)
             times = times.to(device)
             rewards = rewards.to(device)
@@ -529,11 +553,13 @@ def train_h_model(
 
             optimizer.zero_grad()
             loss, parts = compute_loss(
-                model, tables, times, rewards, original_tables, cfg.boundary_loss_weight, cfg
+                model, tables, times, rewards, original_tables, cfg.boundary_loss_weight, cfg,
+                global_step=global_step,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
             optimizer.step()
+            global_step += 1
 
             batch_size = tables.shape[0]
             # Accumulate as a tensor (no .item()) to avoid forcing a
@@ -553,7 +579,7 @@ def train_h_model(
         val_loss_sum = torch.zeros((), device=device)
         val_count = 0
         val_diag = BKDiagnostics()
-        for tables, times, rewards, original_tables in val_loader:
+        for val_step, (tables, times, rewards, original_tables) in enumerate(val_loader):
             tables = tables.to(device)
             times = times.to(device)
             rewards = rewards.to(device)
@@ -561,8 +587,12 @@ def train_h_model(
             # compute_loss's BK term needs autograd (d/dt via
             # torch.autograd.grad) even in eval, so this is NOT wrapped in
             # torch.no_grad(); we detach explicitly below instead.
+            # val_loader has shuffle=False, so val_step is deterministic
+            # across epochs -- the same every-Nth-batch pattern as training,
+            # applied via its own counter rather than the training global_step.
             loss, parts = compute_loss(
-                model, tables, times, rewards, original_tables, cfg.boundary_loss_weight, cfg
+                model, tables, times, rewards, original_tables, cfg.boundary_loss_weight, cfg,
+                global_step=val_step,
             )
             batch_size = tables.shape[0]
             val_loss_sum += loss.detach() * batch_size
@@ -582,8 +612,8 @@ def train_h_model(
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
         )
         if cfg.use_bk_regularization or cfg.terminal_loss_weight > 0.0:
-            tqdm.write(f"[train_h][diagnostics][train] {train_diag.summary()}")
-            tqdm.write(f"[train_h][diagnostics][val]   {val_diag.summary()}")
+            tqdm.write(f"[train_h][diag][train] {train_diag.short_summary()}")
+            tqdm.write(f"[train_h][diag][val]   {val_diag.short_summary()}")
 
         last_ckpt_path = os.path.join(cfg.checkpoint_dir, "h_model_last.pt")
         torch.save({"model_state_dict": model.state_dict(), "epoch": epoch}, last_ckpt_path)
