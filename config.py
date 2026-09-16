@@ -61,9 +61,32 @@ class Config:
     use_bk_regularization: bool = True
     bk_loss_weight: float = 0.01
     terminal_loss_weight: float = 0.1
+    # BK is evaluated on a small random ANCHOR subset of each minibatch (not
+    # every row) -- the PDE residual is a pointwise constraint, so a handful
+    # of anchors per step is enough signal without scaling cost with the
+    # full (often 512-row) MC batch size. Neighbors within that subset are
+    # sampled directly (positive source cell, uniform destination cell), the
+    # same proposal convention as ctmc.propose_move, WITHOUT ever calling
+    # all_neighbors -- a table can have thousands of valid neighbors, and
+    # materializing all of them just to keep bk_num_neighbors is wasted
+    # compute/memory (this previously caused a CUDA OOM at batch_size=512).
+    bk_anchor_batch_size: int = 16
     bk_num_neighbors: int = 32
     bk_log_ratio_clip: float = 10.0
     h_log_epsilon: float = 1e-8
+
+    # --- Guided-sampler initial distribution ----------------------------------
+    # p_T^R(x) \propto h_theta(T,x) is the theoretically correct law to draw
+    # the reverse sampler's X_T from (see sample_guided.sample_x_start_reverse).
+    # "uniform_fallback" skips the h(T,.)-reweighting rejection step and is
+    # only a valid approximation when h_theta(T,.) is itself close to constant
+    # across x -- judged here by its coefficient of variation (std/mean) over
+    # cfg.init_check_num_probe_samples uniform probe tables (see
+    # check_h_constant_at_T), falling back to the exact "rejection" mode
+    # whenever that check fails, rather than hardcoding uniform_fallback
+    # regardless of what the diagnostic finds.
+    init_uniform_fallback_cv_threshold: float = 0.05
+    init_check_num_probe_samples: int = 200
     pretrain_epochs: int = 50
     pretrain_learning_rate: float = 0.001
     pretrain_batch_size: int = 512

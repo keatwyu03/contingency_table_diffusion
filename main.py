@@ -139,8 +139,28 @@ def cmd_sample_guided(cfg: Config) -> None:
     model.eval()
 
     generator = torch.Generator().manual_seed(cfg.seed)
-    mean_h_T, std_h_T = check_h_constant_at_T(model, cfg, num_probe_samples=200, generator=generator)
-    print(f"[diagnostic] h_theta(T, x) over 200 uniform tables: mean={mean_h_T:.6f} std={std_h_T:.6f}")
+    mean_h_T, std_h_T = check_h_constant_at_T(
+        model, cfg, num_probe_samples=cfg.init_check_num_probe_samples, generator=generator
+    )
+    coefficient_of_variation = std_h_T / mean_h_T if mean_h_T > 0 else float("inf")
+    print(
+        f"[diagnostic] h_theta(T, x) over {cfg.init_check_num_probe_samples} uniform tables: "
+        f"mean={mean_h_T:.6f} std={std_h_T:.6f} cv={coefficient_of_variation:.6f}"
+    )
+    if coefficient_of_variation <= cfg.init_uniform_fallback_cv_threshold:
+        init_mode = "uniform_fallback"
+        print(
+            f"[sample-guided] h_theta(T,.) is approximately constant "
+            f"(cv={coefficient_of_variation:.4f} <= {cfg.init_uniform_fallback_cv_threshold}): "
+            f"using init_mode='uniform_fallback'."
+        )
+    else:
+        init_mode = "rejection"
+        print(
+            f"[sample-guided] h_theta(T,.) varies meaningfully "
+            f"(cv={coefficient_of_variation:.4f} > {cfg.init_uniform_fallback_cv_threshold}): "
+            f"using the exact init_mode='rejection' (p_T^R(x) \\propto h_theta(T,x))."
+        )
 
     results = []
     remaining = cfg.num_guided_samples
@@ -150,7 +170,7 @@ def cmd_sample_guided(cfg: Config) -> None:
         batch_n = min(cfg.guided_batch_size, remaining)
         batch_results = simulate_guided_batch(
             model, cfg, num_samples=batch_n, seed=cfg.seed + batch_idx,
-            pbar=pbar, verbose=False, init_mode="uniform_fallback",
+            pbar=pbar, verbose=False, init_mode=init_mode,
         )
         results.extend(batch_results)
         remaining -= batch_n
