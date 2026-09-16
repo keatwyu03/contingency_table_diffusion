@@ -76,16 +76,15 @@ class Config:
     h_log_epsilon: float = 1e-8
 
     # --- Guided-sampler initial distribution ----------------------------------
-    # p_T^R(x) \propto h_theta(T,x) is the theoretically correct law to draw
-    # the reverse sampler's X_T from (see sample_guided.sample_x_start_reverse).
-    # "uniform_fallback" skips the h(T,.)-reweighting rejection step and is
-    # only a valid approximation when h_theta(T,.) is itself close to constant
-    # across x -- judged here by its coefficient of variation (std/mean) over
-    # cfg.init_check_num_probe_samples uniform probe tables (see
-    # check_h_constant_at_T), falling back to the exact "rejection" mode
-    # whenever that check fails, rather than hardcoding uniform_fallback
-    # regardless of what the diagnostic finds.
-    init_uniform_fallback_cv_threshold: float = 0.05
+    # p_T^R(x) \propto h_theta(T,x) is the mathematically exact law to draw
+    # the reverse sampler's X_T from (see sample_guided.sample_x_start_reverse
+    # mode="rejection"). main.cmd_sample_guided always uses "rejection" for
+    # this reason -- init_check_num_probe_samples only controls the size of
+    # a purely informational h_theta(T,.) constancy probe (mean/std/CV
+    # printed, via check_h_constant_at_T), which does NOT select the
+    # sampling mode: skipping rejection in favor of uniform_fallback is an
+    # approximation regardless of how constant h_theta(T,.) looks, so it is
+    # never chosen automatically.
     init_check_num_probe_samples: int = 200
     pretrain_epochs: int = 50
     pretrain_learning_rate: float = 0.001

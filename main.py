@@ -145,22 +145,12 @@ def cmd_sample_guided(cfg: Config) -> None:
     coefficient_of_variation = std_h_T / mean_h_T if mean_h_T > 0 else float("inf")
     print(
         f"[diagnostic] h_theta(T, x) over {cfg.init_check_num_probe_samples} uniform tables: "
-        f"mean={mean_h_T:.6f} std={std_h_T:.6f} cv={coefficient_of_variation:.6f}"
+        f"mean={mean_h_T:.6f} std={std_h_T:.6f} cv={coefficient_of_variation:.6f} "
+        f"(purely informational -- init_mode is always 'rejection', the mathematically "
+        f"exact Doob-h initialization p_T^R(x) \\propto h_theta(T,x); a low CV here would "
+        f"only mean rejection's acceptance rate is high, not that skipping it is exact)"
     )
-    if coefficient_of_variation <= cfg.init_uniform_fallback_cv_threshold:
-        init_mode = "uniform_fallback"
-        print(
-            f"[sample-guided] h_theta(T,.) is approximately constant "
-            f"(cv={coefficient_of_variation:.4f} <= {cfg.init_uniform_fallback_cv_threshold}): "
-            f"using init_mode='uniform_fallback'."
-        )
-    else:
-        init_mode = "rejection"
-        print(
-            f"[sample-guided] h_theta(T,.) varies meaningfully "
-            f"(cv={coefficient_of_variation:.4f} > {cfg.init_uniform_fallback_cv_threshold}): "
-            f"using the exact init_mode='rejection' (p_T^R(x) \\propto h_theta(T,x))."
-        )
+    init_mode = "rejection"
 
     results = []
     remaining = cfg.num_guided_samples
