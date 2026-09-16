@@ -680,6 +680,7 @@ def simulate_guided_trajectories_thinning(
     cfg: Config,
     generator: Optional[torch.Generator] = None,
     proposals_per_chunk: int = 256,
+    pbar: Optional[tqdm] = None,
 ) -> Tuple[List[GuidedSampleResult], ThinningDiagnostics]:
     """Simulate many guided-CTMC trajectories via exact batched thinning.
 
@@ -694,6 +695,11 @@ def simulate_guided_trajectories_thinning(
         (results, diagnostics): results in the same order as x_start;
         diagnostics accumulates proposal/evaluation/rejection/jump/model-call
         counts across the whole run (see ThinningDiagnostics).
+
+    If ``pbar`` is given, its progress is updated (by newly-completed
+    trajectory count) instead of creating and closing a fresh bar -- lets a
+    caller share one bar across multiple calls (e.g. one per sub-batch)
+    without each call starting a new line.
     """
     S = x_start.shape[0]
     x = x_start.clone()
@@ -702,7 +708,9 @@ def simulate_guided_trajectories_thinning(
     active = torch.ones(S, dtype=torch.bool)
     diagnostics = ThinningDiagnostics()
 
-    pbar = tqdm(total=S, desc="simulate_guided_batch[thinning]")
+    owns_pbar = pbar is None
+    if pbar is None:
+        pbar = tqdm(total=S, desc="simulate_guided_batch[thinning]")
 
     while active.any():
         idx = torch.nonzero(active, as_tuple=False).view(-1)
@@ -735,8 +743,8 @@ def simulate_guided_trajectories_thinning(
         if newly_done.numel() > 0:
             active[newly_done] = False
             pbar.update(newly_done.numel())
-
-    pbar.close()
+    if owns_pbar:
+        pbar.close()
 
     results = [
         GuidedSampleResult(
@@ -935,6 +943,8 @@ def simulate_guided_batch(
     seed: Optional[int] = None,
     init_mode: str = "rejection",
     method: str = "thinning",
+    pbar: Optional[tqdm] = None,
+    verbose: bool = True,
 ) -> List[GuidedSampleResult]:
     """Generate ``num_samples`` independent guided trajectories, backward T->0.
 
@@ -965,22 +975,25 @@ def simulate_guided_batch(
     generator.manual_seed(seed)
 
     init_result = sample_x_start_reverse(model, cfg, num_samples, generator, mode=init_mode)
-    print(
-        f"[sample_x_start_reverse mode={init_result.mode}] "
-        f"proposed={init_result.num_proposed} "
-        f"passed={init_result.num_passed} "
-        f"retained={init_result.num_retained} "
-        f"candidate_pass_rate={init_result.candidate_pass_rate:.4f} "
-        f"retained_efficiency={init_result.retained_efficiency:.4f} "
-        f"mean_h_proposed={init_result.mean_h_proposed:.6f} "
-        f"mean_h_accepted={init_result.mean_h_accepted:.6f}"
-    )
+    if verbose:
+        msg = (
+            f"[sample_x_start_reverse mode={init_result.mode}] "
+            f"proposed={init_result.num_proposed} "
+            f"passed={init_result.num_passed} "
+            f"retained={init_result.num_retained} "
+            f"candidate_pass_rate={init_result.candidate_pass_rate:.4f} "
+            f"retained_efficiency={init_result.retained_efficiency:.4f} "
+            f"mean_h_proposed={init_result.mean_h_proposed:.6f} "
+            f"mean_h_accepted={init_result.mean_h_accepted:.6f}"
+        )
+        tqdm.write(msg) if pbar is not None else print(msg)
 
     if method == "thinning":
         results, diagnostics = simulate_guided_trajectories_thinning(
-            init_result.x_start_samples, model, cfg, generator=generator
+            init_result.x_start_samples, model, cfg, generator=generator, pbar=pbar
         )
-        print(diagnostics.summary())
+        if verbose:
+            tqdm.write(diagnostics.summary()) if pbar is not None else print(diagnostics.summary())
         return results
     elif method == "exhaustive":
         return simulate_guided_trajectories_batched(
@@ -1034,5 +1047,58 @@ def summarize_guided_samples(results: List[GuidedSampleResult], cfg: Config) -> 
     lines.append(f"  S_2 = {s2[best_idx].item():.4f}")
     lines.append(f"  R(x) = {rewards[best_idx].item():.4f}")
     lines.append(f"  exact margins satisfied = {bool(exact[best_idx].item())}")
+
+    return "\n".join(lines)
+
+
+def save_guided_samples(results: List[GuidedSampleResult], path: str) -> None:
+    """Save every generated X_0 table (and its jump count) to a torch checkpoint.
+
+    Written for downstream/offline computation on the full sample set (not
+    for personal inspection) -- see format_best_samples / summarize_guided_samples
+    for the human-facing views. Load back with:
+
+        blob = torch.load(path)
+        tables = blob["tables"]       # (num_samples, m, n)
+        num_jumps = blob["num_jumps"]  # (num_samples,)
+    """
+    tables = torch.stack([r.terminal_table for r in results], dim=0)
+    num_jumps = torch.tensor([r.num_jumps for r in results], dtype=torch.int64)
+    torch.save({"tables": tables, "num_jumps": num_jumps}, path)
+
+
+def format_best_samples(
+    results: List[GuidedSampleResult], cfg: Config, top_k: int = 20
+) -> str:
+    """Format the top_k generated tables with the lowest S_2, for human inspection.
+
+    Complements summarize_guided_samples (aggregate stats) and
+    save_guided_samples (the full table set for later computation) -- this
+    is the "look at a handful of the best tables" view.
+    """
+    target_rows = torch.tensor(cfg.target_rows, dtype=torch.float32)
+    target_cols = torch.tensor(cfg.target_cols, dtype=torch.float32)
+
+    generated_tables = torch.stack([r.terminal_table for r in results], dim=0)
+    s2 = squared_margin_error(generated_tables, target_rows, target_cols)
+    rewards = soft_reward(s2, cfg.reward_gamma)
+    exact = exact_margins_satisfied(generated_tables, target_rows, target_cols)
+    num_jumps = torch.tensor([r.num_jumps for r in results], dtype=torch.int64)
+
+    top_k = min(top_k, len(results))
+    best_indices = torch.argsort(s2)[:top_k]
+
+    lines = [f"Best {top_k} generated samples (lowest S_2)", "=" * 40]
+    for rank, idx_t in enumerate(best_indices, start=1):
+        i = int(idx_t.item())
+        table = generated_tables[i]
+        lines.append(
+            f"\nRank {rank}: sample {i}, S_2={s2[i].item():.4f}, "
+            f"R(x)={rewards[i].item():.4f}, jumps={num_jumps[i].item()}, "
+            f"exact_margins={bool(exact[i].item())}"
+        )
+        lines.append(f"  row sums = {row_sums(table).tolist()}")
+        lines.append(f"  col sums = {col_sums(table).tolist()}")
+        lines.append(f"{table.long().tolist()}")
 
     return "\n".join(lines)

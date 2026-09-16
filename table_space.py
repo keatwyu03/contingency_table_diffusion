@@ -4,7 +4,6 @@ from typing import List, Tuple
 
 import torch
 from torch import Tensor
-from tqdm import tqdm
 
 
 def validate_table(x: Tensor, m: int, n: int, total_count: int) -> None:
@@ -68,8 +67,12 @@ def sample_uniform_tables(
     num_bars = d - 1
 
     tables = torch.empty((num_samples, d), dtype=torch.float32, device=device)
-    iterator = tqdm(range(num_samples), desc="sample_uniform_tables", disable=num_samples < 50)
-    for i in iterator:
+    # No progress bar here: this is called repeatedly (once per rejection-
+    # sampling proposal round in sample_x_start_reverse, in addition to
+    # every guided-sampling sub-batch), so a per-call bar spams the console
+    # with many short-lived bars. The outer simulate_guided_batch bar is the
+    # one meaningful progress indicator for the overall run.
+    for i in range(num_samples):
         perm = torch.randperm(num_slots, generator=generator, device=device)
         bar_positions = perm[:num_bars]
         bar_positions, _ = torch.sort(bar_positions)

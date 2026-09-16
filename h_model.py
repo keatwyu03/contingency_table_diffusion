@@ -118,15 +118,20 @@ class HModel(nn.Module):
         self.register_buffer("row_idx", row_idx)
         self.register_buffer("col_idx", col_idx)
 
-    def forward_logits(self, table_norm: Tensor, time_norm: Tensor) -> Tensor:
-        """Compute the raw scalar logit for a batch of (normalized) inputs.
+    def encode(self, table_norm: Tensor, time_norm: Tensor) -> Tensor:
+        """E_phi: embed + transformer-encode + pool (X_t, t) -> a D_MODEL vector.
+
+        This is exactly the "encoder" half of forward_logits, split out so it
+        can be pretrained standalone (see pretrain_score.py) and so its
+        weights can be transferred into a fresh HModel before h-training.
+        H_omega (self.head) is deliberately excluded from this method.
 
         Args:
             table_norm: (B, m, n), already divided by total_count.
             time_norm: (B,), already divided by terminal_time.
 
         Returns:
-            (B,) tensor of logits.
+            (B, D_MODEL) pooled encoder representation.
         """
         B = table_norm.shape[0]
         device = table_norm.device
@@ -148,7 +153,35 @@ class HModel(nn.Module):
         tokens = self.final_ln(tokens)
 
         pooled = tokens.mean(dim=1)  # (B, D_MODEL) -- mean pool over all 144 cell tokens
-        logits = self.head(pooled).squeeze(-1)  # (B,)
+        return pooled
+
+    def encoder_state_dict(self) -> dict:
+        """State dict of exactly the E_phi submodules (excludes self.head)."""
+        encoder_modules = (
+            "count_embedding", "row_embedding", "column_embedding",
+            "time_embedding", "blocks", "final_ln",
+        )
+        return {
+            k: v for k, v in self.state_dict().items()
+            if k.split(".", 1)[0] in encoder_modules
+        }
+
+    def load_encoder_state_dict(self, encoder_state: dict) -> None:
+        """Load a state dict produced by encoder_state_dict (E_phi weights only)."""
+        self.load_state_dict(encoder_state, strict=False)
+
+    def forward_logits(self, table_norm: Tensor, time_norm: Tensor) -> Tensor:
+        """Compute the raw scalar logit for a batch of (normalized) inputs.
+
+        Args:
+            table_norm: (B, m, n), already divided by total_count.
+            time_norm: (B,), already divided by terminal_time.
+
+        Returns:
+            (B,) tensor of logits.
+        """
+        pooled = self.encode(table_norm, time_norm)  # E_phi
+        logits = self.head(pooled).squeeze(-1)  # H_omega
         return logits
 
     def forward(self, table_norm: Tensor, time_norm: Tensor) -> Tensor:

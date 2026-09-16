@@ -14,10 +14,10 @@ class Config:
 
     # --- CTMC parameters --------------------------------------------------
     terminal_time: float = 1.0
-    ctmc_rate: float = 100.0
+    ctmc_rate: float = 1000.0
 
     # --- Reward parameters --------------------------------------------------
-    reward_gamma: float = 0.005
+    reward_gamma: float = 0.01
 
     # --- Target margins ----------------------------------------------------
     target_rows: List[int] = field(default_factory=lambda: [6, 5, 5, 12, 12, 3, 10, 7, 3, 7, 9, 3])
@@ -29,7 +29,7 @@ class Config:
 
     # --- Dataset generation --------------------------------------------------
     batch_size: int = 512
-    num_original_samples: int = 200000
+    num_original_samples: int = 350000
 
     # --- Training ------------------------------------------------------------
     num_epochs: int = 50
@@ -39,9 +39,20 @@ class Config:
     val_fraction: float = 0.1
     boundary_loss_weight: float = 0.0
 
+    # --- CTMC pretraining (E_phi encoder) -------------------------------------
+    use_pretraining: bool = True
+    pretrain_num_trajectories: int = 5000
+    pretrain_epochs: int = 10
+    pretrain_learning_rate: float = 0.001
+    pretrain_batch_size: int = 512
+    # Scales pretrain_learning_rate for E_phi during the joint h-training
+    # fine-tune stage (H_omega keeps the full cfg.learning_rate).
+    pretrain_encoder_lr_scale: float = 0.1
+
     # --- Guided sampling -----------------------------------------------------
-    num_guided_samples: int = 32
-    max_time_step: float = 0.01
+    num_guided_samples: int = 10000
+    guided_batch_size: int = 512
+    max_time_step: float = 0.005
 
     # --- Paths -----------------------------------------------------------------
     checkpoint_dir: str = 'checkpoints'
@@ -68,6 +79,8 @@ class Config:
             raise ValueError(f'reward_gamma must be positive, got {self.reward_gamma}')
         if self.terminal_time <= 0:
             raise ValueError(f'terminal_time must be positive, got {self.terminal_time}')
+        if self.guided_batch_size <= 0:
+            raise ValueError(f'guided_batch_size must be positive, got {self.guided_batch_size}')
 
     def ensure_dirs(self) -> None:
         os.makedirs(self.checkpoint_dir, exist_ok=True)

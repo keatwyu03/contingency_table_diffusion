@@ -14,12 +14,20 @@ import argparse
 import os
 
 import torch
+from tqdm import tqdm
 
 from config import Config
 from ctmc import calibrate_mixing, format_calibration_report
 from h_dataset import HDataset, generate_h_dataset
 from h_model import HModel
-from sample_guided import check_h_constant_at_T, simulate_guided_batch, summarize_guided_samples
+from pretrain_score import pretrain_score
+from sample_guided import (
+    check_h_constant_at_T,
+    format_best_samples,
+    save_guided_samples,
+    simulate_guided_batch,
+    summarize_guided_samples,
+)
 from table_space import make_start_table_even, make_start_table_first_cell
 from train_h import load_h_model, set_seed, train_h_model
 
@@ -74,13 +82,33 @@ def cmd_make_dataset(cfg: Config) -> None:
 
 
 def cmd_train_h(cfg: Config) -> None:
-    """Train h_theta on the saved dataset (generating it first if missing)."""
+    """Train h_theta on the saved dataset (generating it first if missing).
+
+    If cfg.use_pretraining is True, E_phi is first pretrained on CTMC
+    trajectory scoring (see pretrain_score.py), transferred into a fresh
+    HModel, and then E_phi + H_omega are jointly fine-tuned on the soft
+    terminal reward regression objective (E_phi at a reduced learning rate
+    via cfg.pretrain_encoder_lr_scale). If False, behavior is unchanged from
+    before pretraining was added: a freshly-initialized HModel is trained
+    directly on the reward regression objective.
+    """
     set_seed(cfg.seed)
     if not os.path.exists(cfg.dataset_path):
         print(f"Dataset not found at {cfg.dataset_path}, generating it now.")
         cmd_make_dataset(cfg)
     dataset = HDataset.load(cfg.dataset_path)
-    model, history = train_h_model(cfg, dataset)
+
+    if cfg.use_pretraining:
+        print("[train-h] use_pretraining=True: running CTMC pretraining for E_phi.")
+        pretrained_encoder = pretrain_score(cfg)
+        h_model = HModel(cfg.m, cfg.n, cfg.total_count)
+        h_model.load_encoder_state_dict(pretrained_encoder.encoder_state_dict())
+        model, history = train_h_model(
+            cfg, dataset, model=h_model, encoder_lr_scale=cfg.pretrain_encoder_lr_scale
+        )
+    else:
+        model, history = train_h_model(cfg, dataset)
+
     print(
         f"Training complete. best_val_loss={history.best_val_loss:.6f} "
         f"at epoch {history.best_epoch + 1}"
@@ -94,6 +122,15 @@ def cmd_sample_guided(cfg: Config) -> None:
     p_T^R(x) \\propto h_theta(T,x) (via rejection sampling by default; see
     sample_guided.sample_x_start_reverse) and is simulated backward to
     produce a generated (approximate) X_0.
+
+    cfg.num_guided_samples samples are generated in sequential sub-batches
+    of at most cfg.guided_batch_size each (rather than one single batch of
+    every sample at once), since simulate_guided_batch builds tensors sized
+    by the whole batch (all live tables and, for the exhaustive method,
+    every neighbor of every live table) -- for large num_guided_samples
+    (e.g. several thousand) that would risk a memory spike. Each sub-batch
+    uses a distinct seed derived from cfg.seed so sub-batches are
+    independent draws, not repeats.
     """
     set_seed(cfg.seed)
     model = load_h_model(cfg)
@@ -103,15 +140,37 @@ def cmd_sample_guided(cfg: Config) -> None:
     mean_h_T, std_h_T = check_h_constant_at_T(model, cfg, num_probe_samples=200, generator=generator)
     print(f"[diagnostic] h_theta(T, x) over 200 uniform tables: mean={mean_h_T:.6f} std={std_h_T:.6f}")
 
-    results = simulate_guided_batch(
-        model, cfg, num_samples=cfg.num_guided_samples
-    )
+    results = []
+    remaining = cfg.num_guided_samples
+    batch_idx = 0
+    pbar = tqdm(total=cfg.num_guided_samples, desc="sample-guided")
+    while remaining > 0:
+        batch_n = min(cfg.guided_batch_size, remaining)
+        batch_results = simulate_guided_batch(
+            model, cfg, num_samples=batch_n, seed=cfg.seed + batch_idx,
+            pbar=pbar, verbose=False,
+        )
+        results.extend(batch_results)
+        remaining -= batch_n
+        batch_idx += 1
+    pbar.close()
+
+    samples_path = os.path.join(cfg.results_dir, "guided_samples.pt")
+    save_guided_samples(results, samples_path)
+    print(f"\nSaved {len(results)} generated tables to {samples_path}")
+
     text = summarize_guided_samples(results, cfg)
     print(text)
-    out_path = os.path.join(cfg.results_dir, "guided_sampling_report.txt")
-    with open(out_path, "w") as f:
+    report_path = os.path.join(cfg.results_dir, "guided_sampling_report.txt")
+    with open(report_path, "w") as f:
         f.write(text)
-    print(f"\nSaved guided sampling report to {out_path}")
+    print(f"\nSaved guided sampling report to {report_path}")
+
+    best_text = format_best_samples(results, cfg, top_k=20)
+    best_path = os.path.join(cfg.results_dir, "best_samples.txt")
+    with open(best_path, "w") as f:
+        f.write(best_text)
+    print(f"Saved best-20 samples to {best_path}")
 
 
 def cmd_pipeline(cfg: Config) -> None:

@@ -92,11 +92,23 @@ def train_h_model(
     cfg: Config,
     dataset: HDataset,
     model: Optional[HModel] = None,
+    encoder_lr_scale: Optional[float] = None,
 ) -> Tuple[HModel, TrainHistory]:
     """Train h_theta on ``dataset`` per the Config, with checkpointing.
 
     Saves ``h_model_last.pt`` and ``h_model_best.pt`` (by validation loss) to
     cfg.checkpoint_dir, along with the loss history.
+
+    Args:
+        encoder_lr_scale: if given (e.g. cfg.pretrain_encoder_lr_scale after
+            CTMC pretraining -- see pretrain_score.py), E_phi's submodules
+            (model.encoder_state_dict()'s keys) are trained at
+            cfg.learning_rate * encoder_lr_scale while H_omega (model.head)
+            keeps the full cfg.learning_rate, via two AdamW param groups.
+            Both still receive gradients from the same loss.backward() call
+            below, so E_phi and H_omega are jointly fine-tuned. If None
+            (default), every parameter uses a single group at
+            cfg.learning_rate, identical to prior behavior.
 
     Returns:
         (trained model, TrainHistory)
@@ -112,9 +124,25 @@ def train_h_model(
     train_loader = DataLoader(train_subset, batch_size=cfg.batch_size, shuffle=True)
     val_loader = DataLoader(val_subset, batch_size=cfg.batch_size, shuffle=False)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
-    )
+    if encoder_lr_scale is None:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+        )
+    else:
+        encoder_param_names = set(model.encoder_state_dict().keys())
+        encoder_params = [
+            p for name, p in model.named_parameters() if name in encoder_param_names
+        ]
+        head_params = [
+            p for name, p in model.named_parameters() if name not in encoder_param_names
+        ]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": encoder_params, "lr": cfg.learning_rate * encoder_lr_scale},
+                {"params": head_params, "lr": cfg.learning_rate},
+            ],
+            weight_decay=cfg.weight_decay,
+        )
 
     history = TrainHistory()
 
