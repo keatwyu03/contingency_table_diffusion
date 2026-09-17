@@ -1,8 +1,45 @@
 from __future__ import annotations
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List
 import torch
+
+_RUN_DIR_RE = re.compile(r'^run_(\d+)$')
+
+
+def _next_run_number(*dirs_to_scan: str) -> int:
+    found = []
+    for d in dirs_to_scan:
+        if not os.path.isdir(d):
+            continue
+        for entry in os.listdir(d):
+            match = _RUN_DIR_RE.match(entry)
+            if match:
+                found.append(int(match.group(1)))
+    return max(found, default=0) + 1
+
+
+def _claim_run_number(*base_dirs: str) -> int:
+    candidate = _next_run_number(
+        *base_dirs, *(d + '_archive' for d in base_dirs)
+    )
+    while True:
+        created = []
+        collided = False
+        for d in base_dirs:
+            path = os.path.join(d, f'run_{candidate}')
+            try:
+                os.makedirs(path, exist_ok=False)
+                created.append(path)
+            except FileExistsError:
+                collided = True
+                break
+        if not collided:
+            return candidate
+        for path in created:
+            os.rmdir(path)
+        candidate += 1
 
 @dataclass
 class Config:
@@ -30,6 +67,7 @@ class Config:
     # --- Dataset generation --------------------------------------------------
     batch_size: int = 512
     num_original_samples: int = 200000
+    generate_new_data: bool = False
 
     # --- Training ------------------------------------------------------------
     num_epochs: int = 50
@@ -38,79 +76,28 @@ class Config:
     grad_clip_norm: float = 1.0
     val_fraction: float = 0.1
     boundary_loss_weight: float = 0.0
-    # Early stopping: training halts once val_loss fails to improve by at
-    # least early_stop_min_delta for early_stop_patience consecutive epochs.
-    # The final returned/checkpointed model is always the best-val-loss one
-    # (not necessarily the last epoch run), whether or not early stopping
-    # actually triggers.
     early_stop_patience: int = 5
     early_stop_min_delta: float = 1e-5
 
     # --- CTMC pretraining (E_phi encoder) -------------------------------------
-    # Reuses the same num_original_samples CTMC trajectories generated for
-    # the h-training dataset (see h_dataset.py) -- no separate trajectory
-    # set is simulated for pretraining.
-    use_pretraining: bool = False
+    use_pretraining: bool = True
 
     # --- Backward-Kolmogorov (BK) regularization for h-training --------------
-    # Adds two auxiliary terms to the direct Monte Carlo h-regression loss:
-    # a terminal-boundary term (u_theta(0, X_0) == log R(X_0)) and a dynamics
-    # term enforcing the backward-Kolmogorov PDE that log h_theta must solve
-    # under the unconditional CTMC generator (see train_h.compute_loss and
-    # train_h.bk_residual for the derivation and exact sign convention).
     use_bk_regularization: bool = True
     bk_loss_weight: float = 0.01
     terminal_loss_weight: float = 0.001
-    # Like BK, the terminal-boundary term is evaluated on a small random
-    # ANCHOR subset of each minibatch rather than every row: it is a
-    # regularizer computed via a SECOND full transformer forward pass (at
-    # t=0, over original_table instead of the current (X_tau, tau) batch),
-    # so running it over the full (often 512-row) batch every step doubles
-    # the per-step forward/backward memory and was observed to push a
-    # 12GB GPU into OOM. A small anchor subset gives the same boundary
-    # signal, averaged over steps, at a small fraction of the cost.
     terminal_anchor_batch_size: int = 32
-    # BK is evaluated on a small random ANCHOR subset of each minibatch (not
-    # every row) -- the PDE residual is a pointwise constraint, so a handful
-    # of anchors per step is enough signal without scaling cost with the
-    # full (often 512-row) MC batch size. Neighbors within that subset are
-    # sampled directly (positive source cell, uniform destination cell), the
-    # same proposal convention as ctmc.propose_move, WITHOUT ever calling
-    # all_neighbors -- a table can have thousands of valid neighbors, and
-    # materializing all of them just to keep bk_num_neighbors is wasted
-    # compute/memory (this previously caused a CUDA OOM at batch_size=512).
     bk_anchor_batch_size: int = 8
     bk_num_neighbors: int = 32
     bk_log_ratio_clip: float = 10.0
-    # BK's double derivative (autograd through time_norm with create_graph=
-    # True) can only run on the MATH scaled-dot-product-attention backend on
-    # GPUs that don't support a fused kernel with a second derivative (e.g.
-    # sm_70/TITAN V and observed on the V100s used here too) -- measured
-    # locally at ~2x the per-step cost of MC+terminal alone. bk_every_n_steps
-    # computes BK on only every Nth training/validation batch (by a
-    # monotonically increasing global_step counter) instead of every batch,
-    # scaling the BK loss by bk_every_n_steps on the batches where it IS
-    # computed so its contribution stays an unbiased estimate of
-    # bk_loss_weight * L_BK in expectation over steps.
     bk_every_n_steps: int = 4
     h_log_epsilon: float = 1e-8
 
     # --- Guided-sampler initial distribution ----------------------------------
-    # p_T^R(x) \propto h_theta(T,x) is the mathematically exact law to draw
-    # the reverse sampler's X_T from (see sample_guided.sample_x_start_reverse
-    # mode="rejection"). main.cmd_sample_guided always uses "rejection" for
-    # this reason -- init_check_num_probe_samples only controls the size of
-    # a purely informational h_theta(T,.) constancy probe (mean/std/CV
-    # printed, via check_h_constant_at_T), which does NOT select the
-    # sampling mode: skipping rejection in favor of uniform_fallback is an
-    # approximation regardless of how constant h_theta(T,.) looks, so it is
-    # never chosen automatically.
     init_check_num_probe_samples: int = 200
     pretrain_epochs: int = 50
     pretrain_learning_rate: float = 0.001
     pretrain_batch_size: int = 512
-    # Scales pretrain_learning_rate for E_phi during the joint h-training
-    # fine-tune stage (H_omega keeps the full cfg.learning_rate).
     pretrain_encoder_lr_scale: float = 0.1
 
     # --- Guided sampling -----------------------------------------------------
@@ -122,7 +109,7 @@ class Config:
     checkpoint_dir: str = 'checkpoints'
     output_dir: str = 'outputs'
     dataset_path: str = 'outputs/h_dataset.pt'
-    results_dir: str = 'results/pretrain_kolmogorov_hfunction_100'
+    results_dir: str = 'results'
 
     def __post_init__(self) -> None:
         if self.m <= 0 or self.n <= 0:
@@ -147,43 +134,44 @@ class Config:
             raise ValueError(f'guided_batch_size must be positive, got {self.guided_batch_size}')
 
     def ensure_dirs(self) -> None:
-        """Create checkpoint_dir/output_dir/results_dir, auto-avoiding a
-        collision with an IN-PROGRESS run in the same checkpoint_dir or
-        results_dir.
-
-        checkpoint_dir is written to every epoch (h_model_last.pt is
-        overwritten each epoch, before results_dir gets anything -- that
-        only gets a report/loss-curve at the very end), so it is checked
-        for existing content in addition to results_dir; either one having
-        files bumps BOTH dirs together with a "-run2", "-run3", ... suffix
-        (they stay paired) rather than silently letting two concurrent
-        processes overwrite each other's checkpoints. An empty (or
-        not-yet-created) pair of dirs is used as-is -- this only triggers
-        when there's actually something there to collide with.
+        """Create checkpoint_dir/output_dir/results_dir, each numbered into
+        a shared fresh run_N subfolder (never reusing a number already used
+        in any of the three dirs or their _archive siblings), with a
+        config.txt (full resolved config) written into each. Idempotent per
+        instance, since this gets called twice per pipeline run
+        (main.build_config, then train_h.train_h_model).
         """
-        def has_content(path: str) -> bool:
-            return os.path.isdir(path) and len(os.listdir(path)) > 0
+        if getattr(self, '_dirs_resolved', False):
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+            os.makedirs(self.output_dir, exist_ok=True)
+            os.makedirs(self.results_dir, exist_ok=True)
+            return
 
-        original_results_dir = self.results_dir
         original_checkpoint_dir = self.checkpoint_dir
-        suffix = 1
-        while has_content(self.results_dir) or has_content(self.checkpoint_dir):
-            suffix += 1
-            self.results_dir = f"{original_results_dir}-run{suffix}"
-            self.checkpoint_dir = f"{original_checkpoint_dir}-run{suffix}"
-        if suffix > 1:
-            print(
-                f"[Config.ensure_dirs] {original_results_dir} or {original_checkpoint_dir} "
-                f"already has files (another run in progress?) -- using "
-                f"{self.results_dir} and {self.checkpoint_dir} instead."
-            )
+        original_output_dir = self.output_dir
+        original_results_dir = self.results_dir
+        run_number = _claim_run_number(
+            original_checkpoint_dir, original_output_dir, original_results_dir
+        )
+        self.checkpoint_dir = os.path.join(original_checkpoint_dir, f'run_{run_number}')
+        self.output_dir = os.path.join(original_output_dir, f'run_{run_number}')
+        self.results_dir = os.path.join(original_results_dir, f'run_{run_number}')
 
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.results_dir, exist_ok=True)
+        config_text = self.summary()
+        for run_dir in (self.checkpoint_dir, self.output_dir, self.results_dir):
+            with open(os.path.join(run_dir, 'config.txt'), 'w') as f:
+                f.write(config_text)
+
+        print(
+            f'[Config.ensure_dirs] run_{run_number}: checkpoint_dir={self.checkpoint_dir} '
+            f'output_dir={self.output_dir} results_dir={self.results_dir}'
+        )
+        self._dirs_resolved = True
 
     def summary(self) -> str:
         lines = ['Resolved configuration:']
         for k, v in self.__dict__.items():
+            if k.startswith('_'):
+                continue
             lines.append(f'  {k} = {v}')
         return '\n'.join(lines)

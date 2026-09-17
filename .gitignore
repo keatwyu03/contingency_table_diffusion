@@ -8,3 +8,4 @@ results/
 checkpoints_archive/
 outputs_archive/
 *.pt
+*.slurm

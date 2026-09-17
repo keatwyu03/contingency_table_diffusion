@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import Optional
 
 import torch
 from tqdm import tqdm
@@ -81,8 +82,28 @@ def cmd_make_dataset(cfg: Config) -> None:
     print(f"Saved dataset to {cfg.dataset_path}")
 
 
+def ensure_dataset(cfg: Config) -> None:
+    """Generate the dataset if cfg.generate_new_data is True or none exists
+    at cfg.dataset_path yet; otherwise reuse the existing file. Idempotent
+    per cfg instance within one process (e.g. cmd_pipeline calls this, then
+    cmd_train_h calls it again) so generate_new_data=True regenerates once
+    per run, not once per call."""
+    if getattr(cfg, '_dataset_ensured', False):
+        return
+    if cfg.generate_new_data:
+        print(f"generate_new_data=True: regenerating dataset at {cfg.dataset_path}.")
+        cmd_make_dataset(cfg)
+    elif not os.path.exists(cfg.dataset_path):
+        print(f"Dataset not found at {cfg.dataset_path}, generating it now.")
+        cmd_make_dataset(cfg)
+    else:
+        print(f"Dataset already exists at {cfg.dataset_path}, reusing it.")
+    cfg._dataset_ensured = True
+
+
 def cmd_train_h(cfg: Config) -> None:
-    """Train h_theta on the saved dataset (generating it first if missing).
+    """Train h_theta on the saved dataset (generating it first if missing
+    or if cfg.generate_new_data is True).
 
     If cfg.use_pretraining is True, E_phi is first pretrained on CTMC
     trajectory scoring (see pretrain_score.py) using the SAME trajectories
@@ -95,9 +116,7 @@ def cmd_train_h(cfg: Config) -> None:
     objective.
     """
     set_seed(cfg.seed)
-    if not os.path.exists(cfg.dataset_path):
-        print(f"Dataset not found at {cfg.dataset_path}, generating it now.")
-        cmd_make_dataset(cfg)
+    ensure_dataset(cfg)
     dataset = HDataset.load(cfg.dataset_path)
 
     if cfg.use_pretraining:
@@ -117,7 +136,7 @@ def cmd_train_h(cfg: Config) -> None:
     )
 
 
-def cmd_sample_guided(cfg: Config) -> None:
+def cmd_sample_guided(cfg: Config, checkpoint_path: Optional[str] = None) -> None:
     """Run the guided CTMC sampler backward (t=T -> t=0) using the trained checkpoint.
 
     Each guided sample starts from an independent X_T drawn from
@@ -133,9 +152,16 @@ def cmd_sample_guided(cfg: Config) -> None:
     (e.g. several thousand) that would risk a memory spike. Each sub-batch
     uses a distinct seed derived from cfg.seed so sub-batches are
     independent draws, not repeats.
+
+    Args:
+        checkpoint_path: if given, loads this checkpoint instead of
+            cfg.checkpoint_dir's h_model_best.pt -- lets a run reuse an
+            already-trained model from a different run_N (e.g. generating
+            more guided samples from an existing checkpoint without
+            retraining).
     """
     set_seed(cfg.seed)
-    model = load_h_model(cfg)
+    model = load_h_model(cfg, checkpoint_path=checkpoint_path)
     model.eval()
 
     generator = torch.Generator().manual_seed(cfg.seed)
@@ -193,7 +219,7 @@ def cmd_pipeline(cfg: Config) -> None:
     dependency of dataset generation, training, or guided sampling.
     """
     print("\n=== Step 1/3: make-dataset ===")
-    cmd_make_dataset(cfg)
+    ensure_dataset(cfg)
     print("\n=== Step 2/3: train-h ===")
     cmd_train_h(cfg)
     print("\n=== Step 3/3: sample-guided ===")
